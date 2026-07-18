@@ -1,0 +1,11 @@
+pyrofork==2.3.45
+tgcrypto
+motor==2.5.1
+pymongo[srv]==3.12.3
+umongo==3.0.1
+marshmallow==3.14.1
+dnspython==2.3.0
+aiohttp
+requests
+pytz
+Pillow
