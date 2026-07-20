@@ -219,3 +219,11 @@ This is the second time a method assumed to exist on `Client` (`iter_messages`, 
 - The bot must be an **admin member** of each channel listed to receive its posts.
 - `/index` is unchanged and still there for backfilling a channel's *existing* history — `CHANNELS` only covers new posts from here on. Typical setup: `/index` once to catch up, then list the channel in `CHANNELS` so everything after that is automatic.
 - If `CHANNELS` is empty (default), this feature is simply off — no behavior change from before.
+
+---
+
+## v7 fix: wrong file being sent from search results
+
+**Root cause:** once a result had more than 6 files, they got collapsed into one button per quality label (`720P (6 files)`), but that button could only actually link to *one* file_id — so tapping it sent an arbitrary pick from that quality bucket, not necessarily the one implied. That grouping is gone: every file now gets its own button with its real filename, always, no matter how many files there are.
+
+**Also changed how tapping a button delivers the file**, closer to how VJ-FILTER-BOT does it: instead of a `t.me/bot?start=file_<id>` deep link (which re-enters through `/start` and re-looks-up the file), each button's `callback_data` is an exact index into that exact search result list, and the file is sent straight into whichever chat you searched in (group or PM) via `send_cached_media`. There's no reconstruction step in between — the button *is* the file, not a link to look it up again — so there's no path left for a mismatch. Result caches live for an hour (`_RESULTS_TTL`) and expire gracefully with a "please search again" if a button is tapped after that.

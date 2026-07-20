@@ -1,7 +1,7 @@
 import io
 import logging
-import re
 import time
+import uuid
 
 from pyrogram import Client, filters
 from pyrogram.enums import ChatType
@@ -20,7 +20,12 @@ logger = logging.getLogger(__name__)
 _PENDING = {}
 _PENDING_TTL = 600
 
-_QUALITY_RE = re.compile(r'\b(2160p|4k|1440p|1080p|720p|480p|360p)\b', re.IGNORECASE)
+# token -> {"files": [...], "ts": float}  — backs the file-delivery buttons.
+# Files are sent via callback (exact index into this exact list) rather
+# than a reconstructed deep link, so there's no way for a button to end up
+# pointing at the wrong file.
+_RESULTS = {}
+_RESULTS_TTL = 3600
 
 
 def _new_token(chat_id, msg_id):
@@ -34,24 +39,18 @@ def _gc_pending():
         _PENDING.pop(t, None)
 
 
-def _quality_of(filename: str) -> str:
-    m = _QUALITY_RE.search(filename)
-    return m.group(1).upper() if m else "Other"
+def _gc_results():
+    now = time.time()
+    dead = [t for t, v in _RESULTS.items() if now - v["ts"] > _RESULTS_TTL]
+    for t in dead:
+        _RESULTS.pop(t, None)
 
 
-def _group_by_quality(files):
-    """Groups file results by resolution so a series with many episodes
-    doesn't turn into a wall of individual buttons — one row per quality,
-    still linking to the same per-file deep links underneath."""
-    groups = {}
-    for f in files:
-        q = _quality_of(f['file_name'])
-        groups.setdefault(q, []).append(f)
-    # sort qualities high-to-low, "Other" last
-    order = ["2160P", "4K", "1440P", "1080P", "720P", "480P", "360P"]
-    def key(q):
-        return order.index(q) if q in order else len(order)
-    return dict(sorted(groups.items(), key=lambda kv: key(kv[0])))
+def _store_results(files):
+    _gc_results()
+    token = uuid.uuid4().hex[:12]
+    _RESULTS[token] = {"files": files, "ts": time.time()}
+    return token
 
 
 @Client.on_message(
@@ -157,36 +156,51 @@ async def _send_plain_results(bot: Client, message: Message, clean_query: str, s
     )
     if not files:
         return await message.reply(texts.NO_FILES_FOUND.format(query=clean_query))
-    buttons = _file_buttons(bot, files)
+    buttons = _file_buttons(files)
     await message.reply(
         f"📦 Found <b>{total}</b> file(s) for <b>{clean_query}</b>:",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
 
-def _file_buttons(bot: Client, files):
-    """One row per quality bucket when there are enough files that a flat
-    per-file list would be unwieldy (e.g. a whole series); otherwise one
-    row per file as before."""
-    if len(files) <= 6:
-        return [
-            [InlineKeyboardButton(
-                texts.FILE_BUTTON_LABEL.format(name=f['file_name'][:45], size=human_size(f['file_size'])),
-                url=f"https://t.me/{bot.username}?start=file_{f['file_id']}",
-            )]
-            for f in files
-        ]
+def _file_buttons(files):
+    """One button per actual file, labeled with its real filename, sending
+    that exact file via callback when tapped — never a reconstructed
+    lookup, so there's no path for the wrong file to go out."""
+    token = _store_results(files)
+    return [
+        [InlineKeyboardButton(
+            texts.FILE_BUTTON_LABEL.format(name=f['file_name'][:55], size=human_size(f['file_size'])),
+            callback_data=f"getfile|{token}|{i}",
+        )]
+        for i, f in enumerate(files)
+    ]
 
-    groups = _group_by_quality(files)
-    buttons = []
-    for quality, group_files in groups.items():
-        # Telegram deep-link start payloads are capped at 64 chars, so we
-        # can only carry one file per link — pick the most recent file in
-        # that quality bucket and label the button with the count.
-        f = group_files[0]
-        label = f"🎞 {quality} ({len(group_files)} file{'s' if len(group_files) > 1 else ''})"
-        buttons.append([InlineKeyboardButton(label, url=f"https://t.me/{bot.username}?start=file_{f['file_id']}")])
-    return buttons
+
+@Client.on_callback_query(filters.regex(r'^getfile\|'))
+async def on_get_file(bot: Client, cq: CallbackQuery):
+    _, token, idx = cq.data.split('|', 2)
+    entry = _RESULTS.get(token)
+    if not entry:
+        return await cq.answer("This result has expired — please search again.", show_alert=True)
+    try:
+        f = entry["files"][int(idx)]
+    except (IndexError, ValueError):
+        return await cq.answer("File not found.", show_alert=True)
+
+    await cq.answer("Sending file…")
+    try:
+        await bot.send_cached_media(
+            chat_id=cq.message.chat.id,
+            file_id=f['file_id'],
+            protect_content=info.PROTECT_CONTENT,
+        )
+    except Exception as e:
+        logger.warning(f"send_cached_media failed: {e}")
+        await bot.send_message(
+            cq.message.chat.id,
+            "❌ Couldn't send that file — it may have expired. Please search again.",
+        )
 
 
 async def _show_result(bot: Client, message: Message, candidate: dict, clean_query: str,
@@ -228,7 +242,7 @@ async def _show_result(bot: Client, message: Message, candidate: dict, clean_que
         website_part=website_part,
     ) + ep_note
 
-    buttons = _file_buttons(bot, files)
+    buttons = _file_buttons(files)
     if entry:
         buttons.append([InlineKeyboardButton("🌐 Watch on SC Files", url=backend.website_link(kind, entry))])
 
