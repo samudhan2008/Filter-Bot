@@ -30,7 +30,14 @@ COLLECTION_NAME = environ.get('COLLECTION_NAME', 'scfiles_media')
 # ---- Admins / channels ----
 LOG_CHANNEL = int(environ.get('LOG_CHANNEL', '0'))
 ADMINS = [int(a) if id_pattern.search(a) else a for a in environ.get('ADMINS', '').split()]
-CHANNELS = [int(c) if id_pattern.search(c) else c for c in environ.get('CHANNELS', '').split()]
+# Channels to auto-index: any video/document/audio posted here gets saved
+# to the file DB automatically, no /index needed. Comma-separated in the
+# env (e.g. "-1001111111111,-1002222222222,@somepublicchannel").
+CHANNELS = [
+    (int(c) if id_pattern.search(c) else c)
+    for c in (c.strip() for c in environ.get('CHANNELS', '').split(','))
+    if c
+]
 INDEX_REQ_CHANNEL = int(environ.get('INDEX_REQ_CHANNEL', LOG_CHANNEL or 0))
 
 # Admin-authorization flow (group access control): only these groups/users

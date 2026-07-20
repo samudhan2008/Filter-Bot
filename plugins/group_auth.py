@@ -1,6 +1,7 @@
 import logging
 from pyrogram import Client, filters
 from pyrogram.types import Message
+from pyrogram.enums import ChatType
 
 import info
 from database import usersdb
@@ -47,7 +48,7 @@ async def auth_cmd(bot: Client, message: Message):
 
     # Case 2: plain /auth — authorizes the group the command was sent in.
     # Allowed for bot admins OR admins of that specific group.
-    if message.chat.type not in ("group", "supergroup"):
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return await message.reply(
             "Usage:\n"
             "• Send <code>/auth</code> inside a group (as a group admin) to authorize it.\n"
@@ -78,7 +79,7 @@ async def unauth_cmd(bot: Client, message: Message):
         await _log(bot, f"🔒 Group <code>{target_id}</code> unauthorized by {message.from_user.mention}.")
         return
 
-    if message.chat.type not in ("group", "supergroup"):
+    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         return await message.reply(
             "Usage:\n"
             "• Send <code>/unauth</code> inside a group (as a group admin) to remove authorization.\n"

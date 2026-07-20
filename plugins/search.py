@@ -4,6 +4,7 @@ import re
 import time
 
 from pyrogram import Client, filters
+from pyrogram.enums import ChatType
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 import info
@@ -69,7 +70,7 @@ async def on_search_text(bot: Client, message: Message):
         if await usersdb.is_banned(user.id):
             return
 
-    if message.chat.type != "private":
+    if message.chat.type != ChatType.PRIVATE:
         await usersdb.add_group(message.chat.id, message.chat.title or "")
         if not await group_is_allowed(message.chat.id):
             return  # silently ignore unauthorized groups, no spam

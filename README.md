@@ -190,3 +190,32 @@ test pass before going live:
   - Same pattern for `/unauth` / `/unauth <group_id>`.
   - New `/authlist` (admin-only) lists every currently authorized group.
   - Every authorize/unauthorize action now also posts to `LOG_CHANNEL` with who did it.
+
+---
+
+## v4 fix
+
+- **Deploy crash: `ImportError: cannot import name 'coroutine' from 'asyncio'`** — `motor==2.5.1` (required by the pinned `umongo==3.0.1`) calls `asyncio.coroutine`, which Python removed in 3.11. Koyeb's base image was on 3.11. Fixed by pinning the `Dockerfile` to `python:3.10-slim`, where that API still exists — no dependency changes needed. If you ever want to move to Python 3.11+, `motor`, `pymongo`, and `umongo` all need upgrading together (motor 3.x needs pymongo 4.x, which needs a newer umongo release) — that's a bigger jump, not a one-line pin.
+
+---
+
+## v5 fixes (found via real test transcripts)
+
+### Fixed
+- **`/index` produced zero response, every time** — two compounding bugs:
+  1. A previous edit accidentally deleted the `@Client.on_message(...)` decorator above `index_cmd`, so it was never registered as a handler at all — no error, just silence.
+  2. It also depended on `Client.ask()`, which — like `iter_messages()` before it — turned out not to be implemented on this pyrofork build. Rebuilt `/index` to not use `ask()`/`listen()` at all: it now tracks "waiting for a link from this admin" itself (a small in-memory pending-state dict with a TTL) and picks up their next message through a normal handler. You can also skip the prompt entirely with `/index <channel_link>` in one shot.
+- **`/auth` inside a group always fell through to the "Usage:" message instead of authorizing** — and, worse, **all PM searches were silently getting blocked**. Root cause in both: `message.chat.type` is a Pyrogram *enum* (`ChatType.SUPERGROUP`), not the string `"supergroup"` — comparing it to a raw string is always false. That made `group_auth.py`'s `chat.type not in ("group", "supergroup")` always true (so `/auth` never recognized it was in a group), and made `search.py`'s `chat.type != "private"` always true too — which meant every private-chat search was incorrectly treated as needing group-authorization and got dropped. Both now compare against `pyrogram.enums.ChatType.GROUP` / `.SUPERGROUP` / `.PRIVATE` properly.
+- **`/ban` and `/unban` usage messages silently lost their `<user_id>` placeholder** — sent as raw `<user_id>` under HTML parse mode, which Telegram's parser treats as an unrecognized tag and strips. Escaped to `&lt;user_id&gt;` so it actually displays.
+
+### A note on the pyromod-style methods
+This is the second time a method assumed to exist on `Client` (`iter_messages`, then `ask`) turned out to be missing on this specific pyrofork build, and both times the failure was *silent* — an AttributeError with no visible error to the user. If anything else in the bot ever goes quiet with no response and no log entry, that's the pattern to suspect first: check whether the method being called is actually a base Pyrogram method (safe) versus a pyromod/patched convenience method (worth testing directly, since these forks can vary on what they include).
+
+---
+
+## v6 addition: auto-index new channel posts
+
+- **`CHANNELS`** env var (comma-separated channel IDs and/or usernames, e.g. `-1001111111111,-1002222222222,@somepublicchannel`) — any video, document, or audio file posted to these channels going forward is indexed automatically, in real time, no `/index` needed.
+- The bot must be an **admin member** of each channel listed to receive its posts.
+- `/index` is unchanged and still there for backfilling a channel's *existing* history — `CHANNELS` only covers new posts from here on. Typical setup: `/index` once to catch up, then list the channel in `CHANNELS` so everything after that is automatic.
+- If `CHANNELS` is empty (default), this feature is simply off — no behavior change from before.

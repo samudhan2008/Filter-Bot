@@ -23,7 +23,7 @@ async def ban_cmd(bot: Client, message: Message):
         target = int(parts[1])
         reason = parts[2] if len(parts) > 2 else ""
     else:
-        return await message.reply("Usage: /ban <user_id> [reason]  (or reply to a user's message)")
+        return await message.reply("Usage: /ban &lt;user_id&gt; [reason]  (or reply to a user's message)")
     await usersdb.ban_user(target, reason)
     await message.reply(f"🚫 Banned <code>{target}</code>.{f' Reason: {reason}' if reason else ''}")
 
@@ -32,7 +32,7 @@ async def ban_cmd(bot: Client, message: Message):
 async def unban_cmd(bot: Client, message: Message):
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2 or not parts[1].lstrip('-').isdigit():
-        return await message.reply("Usage: /unban <user_id>")
+        return await message.reply("Usage: /unban &lt;user_id&gt;")
     await usersdb.unban_user(int(parts[1]))
     await message.reply(f"✅ Unbanned <code>{parts[1]}</code>.")
 

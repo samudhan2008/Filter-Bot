@@ -1,10 +1,11 @@
 import asyncio
 import logging
 import re
+import time
 
 from pyrogram import Client, filters, enums
 from pyrogram.errors.exceptions.bad_request_400 import ChannelInvalid, UsernameInvalid, UsernameNotModified
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 
 import info
 from database.filesdb import save_files_batch
@@ -13,6 +14,14 @@ logger = logging.getLogger(__name__)
 _lock = asyncio.Lock()
 _cancel_flag = {"cancel": False}
 
+# admin_id -> {"ts": float}  — tracks "we asked this admin for a channel
+# link, waiting for their next message". Deliberately not using
+# Client.ask()/.listen(): this pyrofork build doesn't actually implement
+# them (confirmed by testing — calling ask() raised AttributeError, and
+# with no visible reply, which made the whole command look silently dead).
+_PENDING_INDEX = {}
+_PENDING_TTL = 300
+
 BATCH_SIZE = 200  # bulk-write batch; larger batches = far fewer DB round trips
 LINK_RE = re.compile(r"(https://)?(t\.me/|telegram\.me/|telegram\.dog/)(c/)?(\d+|[a-zA-Z_0-9]+)/(\d+)$")
 
@@ -20,10 +29,9 @@ LINK_RE = re.compile(r"(https://)?(t\.me/|telegram\.me/|telegram\.dog/)(c/)?(\d+
 async def _iter_messages_by_id(bot: Client, chat_id, last_msg_id: int, batch_size: int = 200):
     """
     Reimplementation of Client.iter_messages that doesn't depend on it being
-    mixed into the Client class (it wasn't, on this pyrofork build — hence
-    the AttributeError). Walks message IDs from last_msg_id down to 1 in
-    chunks, using get_messages(list_of_ids), which is a core, always-present
-    method.
+    mixed into the Client class (confirmed missing on this pyrofork build).
+    Walks message IDs from last_msg_id down to 1 in chunks, using
+    get_messages(list_of_ids), which is a core, always-present method.
     """
     current_id = last_msg_id
     while current_id > 0:
@@ -33,37 +41,83 @@ async def _iter_messages_by_id(bot: Client, chat_id, last_msg_id: int, batch_siz
         except Exception as e:
             logger.warning(f"get_messages batch failed at {current_id}: {e}")
             messages = []
-        # Telegram returns them in ascending id order; walk newest-first to
-        # match the old behaviour (doesn't actually matter for indexing).
         for msg in reversed(messages):
             yield msg
         current_id -= batch_size
-async def index_cmd(bot: Client, message):
-    ask = await bot.ask(message.chat.id, "📥 Send the last message link of the channel to index (or forward the last message from it).")
-    chat_id, last_msg_id = None, None
 
-    if ask.text:
-        match = LINK_RE.match(ask.text.strip())
-        if not match:
-            return await ask.reply("❌ Invalid link. Try /index again.")
-        chat_id = match.group(4)
-        last_msg_id = int(match.group(5))
-        if chat_id.isnumeric():
-            chat_id = int("-100" + chat_id)
-    elif ask.forward_from_chat and ask.forward_from_chat.type == enums.ChatType.CHANNEL:
-        last_msg_id = ask.forward_from_message_id
-        chat_id = ask.forward_from_chat.username or ask.forward_from_chat.id
+
+def _gc_pending():
+    now = time.time()
+    dead = [uid for uid, v in _PENDING_INDEX.items() if now - v["ts"] > _PENDING_TTL]
+    for uid in dead:
+        _PENDING_INDEX.pop(uid, None)
+
+
+@Client.on_message(filters.command('index') & filters.user(info.ADMINS))
+async def index_cmd(bot: Client, message: Message):
+    """
+    /index — no argument: ask for the channel link/forward as the *next*
+    message from this admin (tracked via _PENDING_INDEX, not a blocking
+    listener). /index <link> — skip the prompt and go straight to it.
+    """
+    parts = message.text.split(maxsplit=1)
+    if len(parts) > 1 and parts[1].strip():
+        return await _handle_index_input(bot, message, parts[1].strip(), reply_to=message)
+
+    if _lock.locked():
+        return await message.reply("⏳ Another indexing job is already running. Try again later.")
+
+    _gc_pending()
+    _PENDING_INDEX[message.from_user.id] = {"ts": time.time(), "chat_id": message.chat.id}
+    await message.reply(
+        "📥 Send the channel's last message link, or forward the last message from it, as your "
+        "next message here.\n\n(Or next time, skip this step: <code>/index &lt;link&gt;</code>)"
+    )
+
+
+@Client.on_message(filters.private & filters.user(info.ADMINS) & ~filters.command(
+    ['start', 'index', 'auth', 'unauth', 'authlist', 'ban', 'unban', 'broadcast', 'stats', 'logs', 'reindex_check']
+), group=-1)
+async def index_link_reply(bot: Client, message: Message):
+    """Catches an admin's reply to the /index prompt above. Runs in group=-1
+    so it's checked before the general search handler, and only actually
+    does anything if that admin has a pending /index request."""
+    _gc_pending()
+    pending = _PENDING_INDEX.get(message.from_user.id)
+    if not pending:
+        return  # not awaiting anything from this admin — let normal handlers (search) run
+    _PENDING_INDEX.pop(message.from_user.id, None)
+
+    if message.text:
+        await _handle_index_input(bot, message, message.text.strip(), reply_to=message)
+    elif message.forward_from_chat and message.forward_from_chat.type == enums.ChatType.CHANNEL:
+        chat_id = message.forward_from_chat.username or message.forward_from_chat.id
+        last_msg_id = message.forward_from_message_id
+        await _start_indexing(bot, message, chat_id, last_msg_id)
     else:
-        return await ask.reply("❌ That's not a link or a forwarded channel message.")
+        await message.reply("❌ That's not a link or a forwarded channel message. Run /index again.")
 
+
+async def _handle_index_input(bot: Client, message: Message, text: str, reply_to: Message):
+    match = LINK_RE.match(text)
+    if not match:
+        return await reply_to.reply("❌ Invalid link. Run /index again.")
+    chat_id = match.group(4)
+    last_msg_id = int(match.group(5))
+    if chat_id.isnumeric():
+        chat_id = int("-100" + chat_id)
+    await _start_indexing(bot, message, chat_id, last_msg_id)
+
+
+async def _start_indexing(bot: Client, message: Message, chat_id, last_msg_id: int):
     try:
         await bot.get_chat(chat_id)
     except ChannelInvalid:
-        return await ask.reply("❌ This looks like a private channel — make me an admin there first.")
+        return await message.reply("❌ This looks like a private channel — make me an admin there first.")
     except (UsernameInvalid, UsernameNotModified):
-        return await ask.reply("❌ Invalid channel link/username.")
+        return await message.reply("❌ Invalid channel link/username.")
     except Exception as e:
-        return await ask.reply(f"❌ Error: {e}")
+        return await message.reply(f"❌ Error: {e}")
 
     try:
         target = await bot.get_messages(chat_id, last_msg_id)
