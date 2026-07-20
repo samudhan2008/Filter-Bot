@@ -9,3 +9,6 @@ aiohttp
 requests
 pytz
 Pillow
+# No new hard dependencies were needed for the reliability/caching/
+# multi-client improvements — retry, circuit breaker, TTL cache, and
+# poster-on-disk caching are all stdlib-only.

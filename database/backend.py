@@ -20,14 +20,28 @@ import re
 import aiohttp
 
 import info
+from utils.netutil import retry_async, CircuitBreaker
 
 logger = logging.getLogger(__name__)
 
 _cache = {"movies": None, "series": None, "ts": {"movies": 0, "series": 0}}
+_breaker = CircuitBreaker(fail_threshold=4, cooldown=120)
+
+
+@retry_async(retries=3, base_delay=1.0, exceptions=(aiohttp.ClientError,))
+async def _fetch_raw(url: str):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                raise aiohttp.ClientError(f"HTTP {resp.status}")
+            return await resp.json(content_type=None)
 
 
 async def _fetch(kind: str):
-    """kind: 'movies' or 'series'. Cached for BACKEND_CACHE_TTL seconds."""
+    """kind: 'movies' or 'series'. Cached for BACKEND_CACHE_TTL seconds.
+    Backed by a circuit breaker: if the backend is down, we keep serving
+    the last good cache (even if stale) rather than stalling every search
+    while retries run out."""
     now = time.time()
     if _cache[kind] is not None and (now - _cache["ts"][kind]) < info.BACKEND_CACHE_TTL:
         return _cache[kind]
@@ -36,15 +50,16 @@ async def _fetch(kind: str):
         logger.warning("BACKEND_URL is not set; cannot check website availability.")
         return []
 
+    if not _breaker.allow():
+        logger.warning(f"Backend circuit breaker open — serving cached/empty {kind} data.")
+        return _cache[kind] or []
+
     url = f"{info.BACKEND_URL}/api/{kind}"
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status != 200:
-                    logger.warning(f"Backend {url} returned HTTP {resp.status}")
-                    return _cache[kind] or []
-                data = await resp.json(content_type=None)
+        data = await _fetch_raw(url)
+        _breaker.record_success()
     except Exception as e:
+        _breaker.record_failure()
         logger.warning(f"Failed to fetch {url}: {e}")
         return _cache[kind] or []
 
@@ -55,6 +70,15 @@ async def _fetch(kind: str):
     _cache[kind] = data
     _cache["ts"][kind] = now
     return data
+
+
+async def force_refresh():
+    """Bypasses the cache TTL — used by the /reindex_check reconciliation job."""
+    _cache["ts"]["movies"] = 0
+    _cache["ts"]["series"] = 0
+    movies = await _fetch("movies")
+    series = await _fetch("series")
+    return movies, series
 
 
 def _slugify(text: str) -> str:

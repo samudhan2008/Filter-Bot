@@ -63,6 +63,6 @@ async def on_added_to_group(bot: Client, message: Message):
             await usersdb.add_group(message.chat.id, message.chat.title or "")
             await message.reply(
                 "👋 Thanks for adding <b>SC Files Bot</b>!\n\n"
-                "Ask a group admin to run /authorize so I can start serving search "
+                "Ask a group admin to run /auth so I can start serving search "
                 "results here."
             )

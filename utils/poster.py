@@ -6,6 +6,8 @@ TMDB backdrop + a dark gradient at the bottom + the title logo overlaid
 
 import io
 import logging
+import os
+import time
 
 import aiohttp
 from PIL import Image, ImageDraw, ImageFont, ImageOps
@@ -14,6 +16,33 @@ import info
 from utils import tmdb
 
 logger = logging.getLogger(__name__)
+
+os.makedirs(info.POSTER_CACHE_DIR, exist_ok=True)
+
+
+def _cache_path(tmdb_id, kind: str) -> str:
+    return os.path.join(info.POSTER_CACHE_DIR, f"{kind}_{tmdb_id}.png")
+
+
+def _cached(tmdb_id, kind: str):
+    path = _cache_path(tmdb_id, kind)
+    if not os.path.exists(path):
+        return None
+    if time.time() - os.path.getmtime(path) > info.POSTER_CACHE_TTL:
+        return None  # stale — TMDB logo/backdrop may have changed
+    try:
+        with open(path, 'rb') as f:
+            return f.read()
+    except Exception:
+        return None
+
+
+def _store_cache(tmdb_id, kind: str, data: bytes):
+    try:
+        with open(_cache_path(tmdb_id, kind), 'wb') as f:
+            f.write(data)
+    except Exception as e:
+        logger.warning(f"Could not write poster cache: {e}")
 
 CANVAS_SIZE = (1280, 720)
 FONT_PATH_CANDIDATES = [
@@ -62,8 +91,15 @@ def _add_gradient(base: Image.Image) -> Image.Image:
     return Image.alpha_composite(base.convert("RGBA"), overlay)
 
 
-async def build_poster(title: str, backdrop_path: str, logo_url: str = None) -> bytes:
-    """Returns PNG bytes ready to send as a photo."""
+async def build_poster(title: str, backdrop_path: str, logo_url: str = None, tmdb_id=None, kind: str = "movie") -> bytes:
+    """Returns PNG bytes ready to send as a photo. Cached on disk per
+    (kind, tmdb_id) — compositing is the slowest part of a search response,
+    so a repeat search for the same title should never redo it."""
+    if tmdb_id is not None:
+        cached = _cached(tmdb_id, kind)
+        if cached is not None:
+            return cached
+
     backdrop_bytes = await _fetch_bytes(tmdb.backdrop_url(backdrop_path)) if backdrop_path else None
 
     if backdrop_bytes:
@@ -94,7 +130,10 @@ async def build_poster(title: str, backdrop_path: str, logo_url: str = None) -> 
     buf = io.BytesIO()
     canvas.convert("RGB").save(buf, format="PNG")
     buf.seek(0)
-    return buf.read()
+    data = buf.read()
+    if tmdb_id is not None:
+        _store_cache(tmdb_id, kind, data)
+    return data
 
 
 def _draw_title_text(canvas: Image.Image, title: str) -> Image.Image:

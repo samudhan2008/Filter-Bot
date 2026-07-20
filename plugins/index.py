@@ -17,7 +17,27 @@ BATCH_SIZE = 200  # bulk-write batch; larger batches = far fewer DB round trips
 LINK_RE = re.compile(r"(https://)?(t\.me/|telegram\.me/|telegram\.dog/)(c/)?(\d+|[a-zA-Z_0-9]+)/(\d+)$")
 
 
-@Client.on_message(filters.command('index') & filters.user(info.ADMINS))
+async def _iter_messages_by_id(bot: Client, chat_id, last_msg_id: int, batch_size: int = 200):
+    """
+    Reimplementation of Client.iter_messages that doesn't depend on it being
+    mixed into the Client class (it wasn't, on this pyrofork build — hence
+    the AttributeError). Walks message IDs from last_msg_id down to 1 in
+    chunks, using get_messages(list_of_ids), which is a core, always-present
+    method.
+    """
+    current_id = last_msg_id
+    while current_id > 0:
+        batch_ids = list(range(max(1, current_id - batch_size + 1), current_id + 1))
+        try:
+            messages = await bot.get_messages(chat_id, batch_ids)
+        except Exception as e:
+            logger.warning(f"get_messages batch failed at {current_id}: {e}")
+            messages = []
+        # Telegram returns them in ascending id order; walk newest-first to
+        # match the old behaviour (doesn't actually matter for indexing).
+        for msg in reversed(messages):
+            yield msg
+        current_id -= batch_size
 async def index_cmd(bot: Client, message):
     ask = await bot.ask(message.chat.id, "📥 Send the last message link of the channel to index (or forward the last message from it).")
     chat_id, last_msg_id = None, None
@@ -86,7 +106,7 @@ async def _run_index(bot: Client, chat_id, last_msg_id: int, status_msg):
     async with _lock:
         _cancel_flag["cancel"] = False
         try:
-            async for msg in bot.iter_messages(chat_id, last_msg_id, 0):
+            async for msg in _iter_messages_by_id(bot, chat_id, last_msg_id):
                 if _cancel_flag["cancel"]:
                     await flush()
                     break

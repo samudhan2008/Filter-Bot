@@ -1,12 +1,32 @@
+import json
 import logging
 import logging.config
+import time
+
 from aiohttp import web
 from pyrogram import Client
+
 import info
 
 logging.config.fileConfig('logging.conf')
 logging.getLogger().setLevel(logging.INFO)
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
+
+if info.JSON_LOGS:
+    class JsonFormatter(logging.Formatter):
+        def format(self, record):
+            payload = {
+                "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+                "level": record.levelname,
+                "logger": record.name,
+                "message": record.getMessage(),
+            }
+            if record.exc_info:
+                payload["exc_info"] = self.formatException(record.exc_info)
+            return json.dumps(payload)
+
+    for handler in logging.getLogger().handlers:
+        handler.setFormatter(JsonFormatter())
 
 logger = logging.getLogger(__name__)
 
@@ -27,15 +47,38 @@ class SCFilesBot(Client):
         await super().start()
         me = await self.get_me()
         self.username = me.username
-        self.uptime = None
+        self.uptime = time.time()
         logger.info(f"SC Files Bot started as @{self.username}")
+
+        # Search-index setup (safe to call every startup -- Mongo no-ops if
+        # the index already exists with the same spec).
+        from database.filesdb import ensure_indexes
+        await ensure_indexes()
+
+        # Optional multi-client worker pool for send/broadcast load spreading.
+        from utils.clients import start_workers
+        workers = await start_workers()
+        if workers:
+            logger.info(f"{len(workers)} worker bot(s) online for outbound sends.")
+
+        # Keep the "/" command menu in sync automatically — no manual
+        # @BotFather /setcommands step needed after adding a command.
+        from utils.commands import sync_bot_commands
+        await sync_bot_commands(self)
+
         if info.LOG_CHANNEL:
             try:
-                await self.send_message(info.LOG_CHANNEL, f"✅ <b>SC Files Bot restarted</b>\n\n@{self.username} is now online.")
+                await self.send_message(
+                    info.LOG_CHANNEL,
+                    f"✅ <b>SC Files Bot restarted</b>\n\n@{self.username} is now online."
+                    + (f"\n👷 {len(workers)} worker bot(s) active." if workers else ""),
+                )
             except Exception as e:
                 logger.warning(f"Could not message LOG_CHANNEL: {e}")
 
     async def stop(self, *args):
+        from utils.clients import stop_workers
+        await stop_workers()
         await super().stop()
         logger.info("SC Files Bot stopped.")
 

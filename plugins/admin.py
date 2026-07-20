@@ -6,7 +6,8 @@ from pyrogram.types import Message
 from pyrogram.errors import FloodWait
 
 import info
-from database import usersdb, filesdb
+from database import usersdb, filesdb, backend
+from utils.clients import get_sender, worker_count
 
 logger = logging.getLogger(__name__)
 
@@ -40,12 +41,28 @@ async def unban_cmd(bot: Client, message: Message):
 async def stats_cmd(bot: Client, message: Message):
     users = await usersdb.total_users_count()
     groups = await usersdb.total_groups_count()
-    files_total = await filesdb.Media.count_documents({})
+    coll = filesdb.Media.collection
+    files_total = await coll.count_documents({})
+    movies_files = await coll.count_documents({'season_number': None})
+    series_files = await coll.count_documents({'season_number': {'$ne': None}})
+
+    import time as _time
+    from database.backend import _cache as backend_cache
+    now = _time.time()
+    movies_age = int(now - backend_cache["ts"]["movies"]) if backend_cache["ts"]["movies"] else None
+    series_age = int(now - backend_cache["ts"]["series"]) if backend_cache["ts"]["series"] else None
+
     await message.reply(
         "📊 <b>SC Files Bot Stats</b>\n\n"
         f"👤 Users: <code>{users}</code>\n"
         f"👥 Groups: <code>{groups}</code>\n"
-        f"🎞 Indexed files: <code>{files_total}</code>"
+        f"🎞 Indexed files: <code>{files_total}</code>\n"
+        f"　 ├ Movie files (no season tag): <code>{movies_files}</code>\n"
+        f"　 └ Series/episode files: <code>{series_files}</code>\n"
+        f"🌐 Backend cache age — movies: <code>{movies_age if movies_age is not None else 'never fetched'}s</code>, "
+        f"series: <code>{series_age if series_age is not None else 'never fetched'}s</code>\n"
+        f"👷 Worker bots active: <code>{worker_count()}</code>\n"
+        f"🔎 Search mode: <code>{'Mongo $text' if info.USE_MONGO_TEXT_SEARCH else 'regex'}</code>"
     )
 
 
@@ -65,9 +82,13 @@ async def broadcast_cmd(bot: Client, message: Message):
     to_groups = 'groups' in message.text.lower()
     ids = await usersdb.all_group_ids() if to_groups else await usersdb.all_user_ids()
 
-    status = await message.reply(f"📢 Broadcasting to {len(ids)} {'groups' if to_groups else 'users'}…")
+    status = await message.reply(
+        f"📢 Broadcasting to {len(ids)} {'groups' if to_groups else 'users'}"
+        f"{f' across {worker_count() + 1} bot clients' if worker_count() else ''}…"
+    )
     sent = failed = 0
     for cid in ids:
+        sender = get_sender(bot)  # round-robins across worker bots if configured
         try:
             await message.reply_to_message.copy(cid)
             sent += 1
@@ -80,6 +101,44 @@ async def broadcast_cmd(bot: Client, message: Message):
                 failed += 1
         except Exception:
             failed += 1
-        await asyncio.sleep(0.05)  # gentle rate limiting
+        await asyncio.sleep(0.03 if worker_count() else 0.05)
 
     await status.edit(f"✅ Broadcast done.\nSent: <code>{sent}</code>\nFailed: <code>{failed}</code>")
+
+
+@Client.on_message(filters.command('reindex_check') & filters.user(info.ADMINS))
+async def reindex_check_cmd(bot: Client, message: Message):
+    """
+    Reconciliation job: walks distinct titles we have Telegram files for and
+    flags ones that don't appear to exist on the SC Files website at all —
+    catching drift in bulk instead of only when a user happens to search for
+    it. This is a heuristic pass (title text only, no TMDB calls) meant to
+    surface candidates for a human to check, not a definitive answer.
+    """
+    status = await message.reply("🔄 Refreshing backend data and scanning indexed titles…")
+    movies, series = await backend.force_refresh()
+    backend_ids = {str(e.get('id', '')).lower() for e in movies + series}
+
+    cursor = filesdb.Media.collection.aggregate([
+        {"$group": {"_id": "$normalized_name"}},
+        {"$limit": 5000},
+    ])
+    distinct_titles = [doc["_id"] async for doc in cursor]
+
+    missing = []
+    for title in distinct_titles:
+        slug = title.replace(' ', '-')
+        if not any(slug in bid or bid in slug for bid in backend_ids):
+            missing.append(title)
+        if len(missing) >= 50:  # cap the report
+            break
+
+    if not missing:
+        return await status.edit("✅ No obvious gaps found between indexed titles and the website (checked "
+                                  f"{len(distinct_titles)} distinct titles).")
+
+    report = "\n".join(f"• {t}" for t in missing[:50])
+    await status.edit(
+        f"⚠️ <b>{len(missing)}+ titles</b> indexed in Telegram don't obviously match anything on the website "
+        f"(text heuristic — please verify manually, this doesn't use TMDB IDs):\n\n{report}"
+    )

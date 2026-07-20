@@ -119,3 +119,74 @@ plugins/
   one candidate and no year was given, per what you asked for. If that ends
   up too chatty for very common titles, `_is_unambiguous()` in
   `plugins/search.py` is the one place to loosen it.
+
+---
+
+## v2 additions (reliability, scale, and search improvements)
+
+### Search & matching
+- **Spell-check suggestions** — when a search returns zero local files (in PM), the bot samples titles sharing a word with your query and ranks them by similarity (`difflib`), suggesting close matches instead of a flat "not found."
+- **TMDB result caching** — `search_multi()` and `get_logo_url()` are cached in memory per `TMDB_CACHE_TTL` seconds (default 600), so a trending title doesn't cost a fresh TMDB call on every search.
+- **Season/episode-aware search** — queries like `"GOT S02E05"` or `"Money Heist season 3"` are parsed into season/episode filters and applied directly against the indexed files (which are now tagged with `season_number`/`ep_number` at index time).
+
+### Poster/UX
+- **On-disk poster cache** — composited posters are cached to `POSTER_CACHE_DIR` (default `poster_cache/`) keyed by `(kind, tmdb_id)`, TTL `POSTER_CACHE_TTL` (default 1 day). Repeat searches for the same title skip compositing entirely.
+- **Quality-grouped file buttons** — once a result has more than 6 matching files (typical for a full series), buttons collapse to one row per resolution (`720P (6 files)`) instead of one row per raw file.
+
+### Reliability
+- **Retry + circuit breaker** (`utils/netutil.py`) wraps TMDB and backend HTTP calls: 3 attempts with exponential backoff, and after repeated consecutive failures the breaker "opens" for a cooldown window so a dead service can't stall every incoming search — cached data is served instead.
+- **`/reindex_check`** (admin-only) — refreshes the backend cache and scans indexed titles for ones that don't obviously exist on the website, so gaps can be caught in bulk instead of only when a user happens to search for that exact title. It's a text-heuristic pass meant to flag candidates for a human to verify, not a definitive tmdb_id-level check.
+
+### Admin/ops
+- **`/stats`** now breaks down indexed files (movie vs series/episode files), shows backend cache age, worker-bot count, and which search mode is active.
+- **Structured JSON logs** — set `JSON_LOGS=True` to switch the root logger to single-line JSON output (good for log shipping / querying).
+
+### Scaling
+- **Mongo text search option** — set `USE_MONGO_TEXT_SEARCH=True` to switch from regex scans to a proper Mongo text index (created automatically at startup). Worth flipping once the file collection gets into the hundreds of thousands; regex scans stay fine below that.
+- **Multi-client worker pool** — set `WORKER_BOT_TOKENS` (space-separated extra bot tokens from @BotFather) to spin up additional bot clients used purely for broadcast sends, round-robin, so a big broadcast doesn't eat into the primary bot's flood limits. The primary bot still handles all commands/search.
+
+### New/changed environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TMDB_CACHE_TTL` | `600` | seconds to cache TMDB search/logo results |
+| `POSTER_CACHE_DIR` | `poster_cache` | disk path for cached composited posters |
+| `POSTER_CACHE_TTL` | `86400` | seconds before a cached poster is rebuilt |
+| `USE_MONGO_TEXT_SEARCH` | `False` | switch search from regex to Mongo `$text` |
+| `WORKER_BOT_TOKENS` | *(empty)* | space-separated extra bot tokens for send load-spreading |
+| `JSON_LOGS` | `False` | structured JSON logging instead of plain text |
+| `SUGGEST_MATCH_CUTOFF` | `0.55` | similarity threshold (0–1) for "did you mean" suggestions |
+| `SUGGEST_MAX_RESULTS` | `5` | max suggestions shown |
+
+### Still not integration-tested
+
+Same caveat as before, now more so: circuit breakers, the worker pool, and
+`USE_MONGO_TEXT_SEARCH` all need a real Telegram bot token, MongoDB, and
+TMDB/backend access to verify end-to-end — I don't have those here. Suggested
+test pass before going live:
+1. `/index` a small channel, confirm season/episode tagging on a series (check
+   a doc in Mongo for `season_number`/`ep_number`).
+2. Search something ambiguous ("Leo"), something with a season/episode
+   ("... S01E03"), and something guaranteed to miss (gibberish) to see the
+   suggestion path.
+3. Toggle `USE_MONGO_TEXT_SEARCH=True` once there's enough indexed data to
+   notice a difference, and confirm the text index got created (`/stats`
+   shows the active mode).
+4. If you add `WORKER_BOT_TOKENS`, run a small `/broadcast` and check
+   `/stats` reports the right worker count.
+
+---
+
+## v3 fixes/additions
+
+### Fixed
+- **`/index` crash (`AttributeError: 'SCFilesBot' object has no attribute 'iter_messages'`)** — this pyrofork build doesn't mix `iter_messages` into `Client`. Replaced with a manual ID-batch fetcher (`_iter_messages_by_id` in `plugins/index.py`) built on `get_messages`, which is always present. Functionally identical, and this was also the root cause of "no response in the group" — the DB was empty because indexing never completed, so there was nothing to match against. Once `/index` finishes cleanly, group search responds normally (it stays silent on zero matches in groups, by design, to avoid noise on unrelated chat).
+
+### Added
+- **Auto command-menu sync** — on every startup the bot pushes its command list to Telegram automatically (`utils/commands.py`), so the "/" menu is always current with no manual `@BotFather /setcommands` step. Admins (from `ADMINS`) get an extended menu (index, ban, broadcast, etc.) scoped to their own private chat; everyone else sees only `/start`, `/auth`, `/unauth`.
+- **`/authorize` → `/auth`, `/unauthorize` → `/unauth`**, with a new second mode:
+  - `/auth` (no args, sent inside a group) — authorizes that group. Usable by group admins or bot admins.
+  - `/auth <group_id>` (sent from *anywhere* — PM to the bot, another chat, wherever) — bot admins only, authorizes the given group ID directly without needing to be in it.
+  - Same pattern for `/unauth` / `/unauth <group_id>`.
+  - New `/authlist` (admin-only) lists every currently authorized group.
+  - Every authorize/unauthorize action now also posts to `LOG_CHANNEL` with who did it.

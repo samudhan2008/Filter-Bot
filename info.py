@@ -50,6 +50,26 @@ BACKEND_CACHE_TTL = int(environ.get('BACKEND_CACHE_TTL', '300'))  # seconds
 # ---- TMDB ----
 TMDB_API_KEY = environ.get('TMDB_API_KEY', '')
 TMDB_IMG_BASE = "https://image.tmdb.org/t/p"
+TMDB_CACHE_TTL = int(environ.get('TMDB_CACHE_TTL', '600'))  # seconds, search + logo cache
+
+# ---- Poster cache ----
+POSTER_CACHE_DIR = environ.get('POSTER_CACHE_DIR', 'poster_cache')
+POSTER_CACHE_TTL = int(environ.get('POSTER_CACHE_TTL', '86400'))  # 1 day on disk
+
+# ---- Search engine ----
+# Mongo text search scales far better than regex scans once the file
+# collection is large. Needs a one-time text index (created automatically
+# at startup by database/filesdb.py if this is True).
+USE_MONGO_TEXT_SEARCH = is_enabled(environ.get('USE_MONGO_TEXT_SEARCH', 'False'), False)
+
+# ---- Multi-client worker pool ----
+# Extra bot tokens (space-separated) used purely to spread file-sending /
+# broadcast load across multiple Telegram bot sessions, avoiding a single
+# bot's flood limits during busy periods. Optional.
+WORKER_BOT_TOKENS = environ.get('WORKER_BOT_TOKENS', '').split()
+
+# ---- Structured logging ----
+JSON_LOGS = is_enabled(environ.get('JSON_LOGS', 'False'), False)
 
 # ---- URL shortener ----
 SHORTLINK_MODE = is_enabled(environ.get('SHORTLINK_MODE', 'False'), False)
@@ -61,6 +81,8 @@ PICS = (environ.get('PICS', 'https://graph.org/file/ce1723991756e48c35aa1.jpg'))
 CACHE_TIME = int(environ.get('CACHE_TIME', '1800'))
 PROTECT_CONTENT = is_enabled(environ.get('PROTECT_CONTENT', 'False'), False)
 MAX_RESULTS = int(environ.get('MAX_RESULTS', '10'))
+SUGGEST_MATCH_CUTOFF = float(environ.get('SUGGEST_MATCH_CUTOFF', '0.55'))  # difflib similarity, 0-1
+SUGGEST_MAX_RESULTS = int(environ.get('SUGGEST_MAX_RESULTS', '5'))
 PORT = environ.get('PORT', '8080')
 USE_CAPTION_FILTER = is_enabled(environ.get('USE_CAPTION_FILTER', 'True'), True)
 
