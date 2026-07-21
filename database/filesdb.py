@@ -11,13 +11,14 @@ in the DB but the bot can't find it".
 import logging
 import re
 import base64
+from datetime import datetime, timezone
 from struct import pack
 
 import difflib
 
 from pyrogram.file_id import FileId
 from pymongo.errors import DuplicateKeyError, BulkWriteError
-from pymongo import InsertOne, TEXT
+from pymongo import InsertOne, TEXT, DESCENDING
 from umongo import Instance, Document, fields
 from motor.motor_asyncio import AsyncIOMotorClient
 from marshmallow.exceptions import ValidationError
@@ -44,6 +45,8 @@ class Media(Document):
     caption = fields.StrField(allow_none=True)
     season_number = fields.IntField(allow_none=True)
     ep_number = fields.IntField(allow_none=True)
+    file_date = fields.DateTimeField(allow_none=True)   # when it was originally posted to the source channel
+    indexed_at = fields.DateTimeField(allow_none=True)  # when *this bot* saved it — fallback sort key
 
     class Meta:
         indexes = ('$normalized_name',)
@@ -59,7 +62,9 @@ async def ensure_indexes():
         await Media.collection.create_index([('file_name', TEXT), ('caption', TEXT)], name='scfiles_text_idx')
         await Media.collection.create_index('season_number')
         await Media.collection.create_index('ep_number')
-        logger.info("Ensured filesdb indexes (text + season/episode).")
+        await Media.collection.create_index([('file_date', DESCENDING), ('indexed_at', DESCENDING)],
+                                             name='scfiles_recency_idx')
+        logger.info("Ensured filesdb indexes (text + season/episode + recency).")
     except Exception as e:
         logger.warning(f"Could not ensure indexes (non-fatal): {e}")
 
@@ -115,6 +120,8 @@ def _doc_from_media(media):
         'caption': media.caption.html if media.caption else None,
         'season_number': season,
         'ep_number': episode,
+        'file_date': getattr(media, 'file_date', None),
+        'indexed_at': datetime.now(timezone.utc),
     }
 
 
@@ -126,6 +133,7 @@ async def save_file(media):
             normalized_name=doc['normalized_name'], file_size=doc['file_size'],
             file_type=doc['file_type'], mime_type=doc['mime_type'], caption=doc['caption'],
             season_number=doc['season_number'], ep_number=doc['ep_number'],
+            file_date=doc['file_date'], indexed_at=doc['indexed_at'],
         )
     except ValidationError:
         logger.exception('Error building Media doc')
@@ -172,7 +180,7 @@ def _build_regex_and(query: str):
     words = [w for w in q.split(' ') if w]
     if not words:
         return re.compile('.', re.IGNORECASE)
-    lookaheads = ''.join(f'(?=.*\\b{re.escape(w)})' for w in words)
+    lookaheads = ''.join(f'(?=.*\\b{re.escape(w)}\\b)' for w in words)
     return re.compile(lookaheads, re.IGNORECASE)
 
 
@@ -208,44 +216,65 @@ async def get_search_results(query, file_type=None, max_results=None, offset=0, 
        just "hello.mkv" still turns up for "hi hello", just ranked after
        anything that matched both words.
 
-    Results are merged with pass 1 first, pass 2 appended after, deduped,
-    capped at max_results. `total` reflects the count across both passes.
+    The two passes are treated as one virtual concatenated, sorted list
+    (pass 1 entirely before pass 2) for pagination purposes, so `offset`
+    works correctly across page boundaries regardless of which pass a given
+    page's results fall in. Within each pass, results are sorted newest
+    first (by original post date, falling back to when the bot indexed it).
     """
     max_results = max_results or info.MAX_RESULTS
     base = _base_filter(file_type, season, episode)
     words = [w for w in normalize(query).split(' ') if w]
     coll = Media.collection
+    recency_sort = [('file_date', -1), ('indexed_at', -1)]
 
-    # ---- Pass 1: combined (priority) ----
+    # ---- Pass 1 filter (combined / priority) ----
     if info.USE_MONGO_TEXT_SEARCH and query.strip():
         combined_filt = {**base, '$text': {'$search': query}}
-        cursor1 = coll.find(combined_filt, {'score': {'$meta': 'textScore'}}).sort(
-            [('score', {'$meta': 'textScore'})])
+        pass1_sort = [('score', {'$meta': 'textScore'})] + recency_sort
+        pass1_projection = {'score': {'$meta': 'textScore'}}
     else:
         regex_and = _build_regex_and(query)
         combined_filt = {**base, 'normalized_name': regex_and}
         if info.USE_CAPTION_FILTER:
             combined_filt = {**base, '$or': [{'normalized_name': regex_and}, {'caption': regex_and}]}
-        cursor1 = coll.find(combined_filt).sort('$natural', -1)
+        pass1_sort = recency_sort
+        pass1_projection = None
 
     total1 = await coll.count_documents(combined_filt)
-    raw1 = await cursor1.skip(offset).limit(max_results).to_list(length=max_results)
-    seen_ids = {d['_id'] for d in raw1}
 
-    # ---- Pass 2: individual words (fallback, lower priority) ----
-    raw2, total2 = [], 0
-    remaining = max_results - len(raw1)
-    if len(words) > 1 and remaining > 0:
+    # ---- Pass 2 filter (individual words, excluding anything pass 1 already covers) ----
+    # Note: can't $nor a filter containing $text (Mongo disallows nesting
+    # $text under $nor/$not), so exclusion always uses the regex-AND form,
+    # even in USE_MONGO_TEXT_SEARCH mode — a harmless approximation, it
+    # just prevents an obvious duplicate rather than needing to be exact.
+    total2 = 0
+    word_filt = None
+    if len(words) > 1:
+        regex_and_excl = _build_regex_and(query)
         regex_any = _build_regex_any(words)
-        word_filt = {**base, '_id': {'$nin': list(seen_ids)}, 'normalized_name': regex_any}
+        word_filt = {**base, 'normalized_name': regex_any, '$nor': [{'normalized_name': regex_and_excl}]}
         total2 = await coll.count_documents(word_filt)
-        cursor2 = coll.find(word_filt).sort('$natural', -1).limit(remaining)
-        raw2 = await cursor2.to_list(length=remaining)
 
     total = total1 + total2
     next_offset = offset + max_results
     if next_offset >= total:
         next_offset = ''
+
+    # ---- Virtual concatenation: pass 1 results [0, total1), then pass 2 [total1, total) ----
+    raw1, raw2 = [], []
+    if offset < total1:
+        take1 = min(max_results, total1 - offset)
+        cursor1 = coll.find(combined_filt, pass1_projection).sort(pass1_sort).skip(offset).limit(take1)
+        raw1 = await cursor1.to_list(length=take1)
+        remaining = max_results - len(raw1)
+        if remaining > 0 and word_filt is not None:
+            cursor2 = coll.find(word_filt).sort(recency_sort).skip(0).limit(remaining)
+            raw2 = await cursor2.to_list(length=remaining)
+    elif word_filt is not None:
+        offset2 = offset - total1
+        cursor2 = coll.find(word_filt).sort(recency_sort).skip(offset2).limit(max_results)
+        raw2 = await cursor2.to_list(length=max_results)
 
     files = [_normalize_doc(d) for d in (raw1 + raw2)]
     return files, next_offset, total

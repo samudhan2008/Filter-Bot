@@ -146,6 +146,12 @@ async def _run_index(bot: Client, chat_id, last_msg_id: int, status_msg):
     total_saved = duplicate = errors = skipped_non_media = skipped_deleted = 0
     buffer = []
     current = 0
+    # media_group_id -> caption. Telegram albums (several files posted as
+    # one post) only carry the caption on one item in the group — the rest
+    # arrive with msg.caption = None. This backfills it from whichever
+    # message in the group actually had it, so every file from that post
+    # ends up searchable by the caption text too, not just the one item.
+    group_captions = {}
 
     async def flush():
         nonlocal total_saved, duplicate, errors, buffer
@@ -156,6 +162,25 @@ async def _run_index(bot: Client, chat_id, last_msg_id: int, status_msg):
         duplicate += dup
         errors += err
         buffer = []
+
+    async def resolve_caption(msg):
+        if msg.caption:
+            return msg.caption
+        if not msg.media_group_id:
+            return None
+        if msg.media_group_id in group_captions:
+            return group_captions[msg.media_group_id]
+        caption = None
+        try:
+            group = await bot.get_media_group(chat_id, msg.id)
+            for item in group:
+                if item.caption:
+                    caption = item.caption
+                    break
+        except Exception as e:
+            logger.warning(f"get_media_group failed for {msg.id}: {e}")
+        group_captions[msg.media_group_id] = caption  # cache even if None, avoid refetching
+        return caption
 
     async with _lock:
         _cancel_flag["cancel"] = False
@@ -180,7 +205,8 @@ async def _run_index(bot: Client, chat_id, last_msg_id: int, status_msg):
                 if not msg.media:
                     skipped_non_media += 1
                     continue
-                if msg.media not in (enums.MessageMediaType.VIDEO, enums.MessageMediaType.AUDIO, enums.MessageMediaType.DOCUMENT):
+                if msg.media not in (enums.MessageMediaType.VIDEO, enums.MessageMediaType.AUDIO,
+                                      enums.MessageMediaType.DOCUMENT, enums.MessageMediaType.ANIMATION):
                     skipped_non_media += 1
                     continue
                 media = getattr(msg, msg.media.value, None)
@@ -188,7 +214,8 @@ async def _run_index(bot: Client, chat_id, last_msg_id: int, status_msg):
                     skipped_non_media += 1
                     continue
                 media.file_type = msg.media.value
-                media.caption = msg.caption
+                media.caption = await resolve_caption(msg)
+                media.file_date = msg.date
                 buffer.append(media)
                 if len(buffer) >= BATCH_SIZE:
                     await flush()

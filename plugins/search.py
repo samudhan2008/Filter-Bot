@@ -1,9 +1,10 @@
 import io
 import logging
+import math
 import time
 import uuid
 
-from pyrogram import Client, filters
+from pyrogram import Client, filters, enums
 from pyrogram.enums import ChatType
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
@@ -20,10 +21,10 @@ logger = logging.getLogger(__name__)
 _PENDING = {}
 _PENDING_TTL = 600
 
-# token -> {"files": [...], "ts": float}  — backs the file-delivery buttons.
-# Files are sent via callback (exact index into this exact list) rather
-# than a reconstructed deep link, so there's no way for a button to end up
-# pointing at the wrong file.
+# token -> {"files": [...], "ctx": {...}, "ts": float}  — backs both the
+# file-delivery buttons (exact index into "files", no reconstruction, so
+# there's no path for the wrong file to go out) and pagination (ctx carries
+# enough of the original search to refetch the next/previous page).
 _RESULTS = {}
 _RESULTS_TTL = 3600
 
@@ -46,11 +47,51 @@ def _gc_results():
         _RESULTS.pop(t, None)
 
 
-def _store_results(files):
+def _new_result_entry(files, query, season, episode, offset, max_results, total, extra_buttons=None):
+    """Stores one page of results + enough search context to fetch the next
+    one. Re-used (same token) across pagination clicks on the same message
+    — we just overwrite "files"/"ctx" in place and edit the message's
+    buttons, rather than sending a new message each page."""
     _gc_results()
     token = uuid.uuid4().hex[:12]
-    _RESULTS[token] = {"files": files, "ts": time.time()}
-    return token
+    ctx = {
+        "query": query, "season": season, "episode": episode,
+        "offset": offset, "max_results": max_results, "total": total,
+        "extra_buttons": extra_buttons or [],
+    }
+    _RESULTS[token] = {"files": files, "ctx": ctx, "ts": time.time()}
+    return token, ctx
+
+
+def _file_button_rows(token, files):
+    return [
+        [InlineKeyboardButton(
+            texts.FILE_BUTTON_LABEL.format(name=f['file_name'][:55], size=human_size(f['file_size'])),
+            callback_data=f"getfile|{token}|{i}",
+        )]
+        for i, f in enumerate(files)
+    ]
+
+
+def _pagination_row(token, offset, max_results, total):
+    if total <= max_results:
+        return []
+    pages = max(1, math.ceil(total / max_results))
+    current_page = offset // max_results + 1
+    row = []
+    if offset > 0:
+        row.append(InlineKeyboardButton("◀️ Prev", callback_data=f"pg|{token}|prev"))
+    row.append(InlineKeyboardButton(f"📄 {current_page}/{pages}", callback_data="noop"))
+    if offset + max_results < total:
+        row.append(InlineKeyboardButton("Next ▶️", callback_data=f"pg|{token}|next"))
+    return [row]
+
+
+def _build_markup(token, files, ctx):
+    rows = _file_button_rows(token, files)
+    rows.extend(ctx.get("extra_buttons", []))
+    rows.extend(_pagination_row(token, ctx["offset"], ctx["max_results"], ctx["total"]))
+    return InlineKeyboardMarkup(rows)
 
 
 @Client.on_message(
@@ -151,30 +192,50 @@ async def on_pick_candidate(bot: Client, cq: CallbackQuery):
 
 
 async def _send_plain_results(bot: Client, message: Message, clean_query: str, season=None, episode=None):
+    max_results = info.MAX_RESULTS
     files, _, total = await filesdb.get_search_results(
-        clean_query, max_results=info.MAX_RESULTS, season=season, episode=episode
+        clean_query, max_results=max_results, offset=0, season=season, episode=episode
     )
     if not files:
         return await message.reply(texts.NO_FILES_FOUND.format(query=clean_query))
-    buttons = _file_buttons(files)
+
+    token, ctx = _new_result_entry(files, clean_query, season, episode, 0, max_results, total)
+    markup = _build_markup(token, files, ctx)
     await message.reply(
         f"📦 Found <b>{total}</b> file(s) for <b>{clean_query}</b>:",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        reply_markup=markup,
     )
 
 
-def _file_buttons(files):
-    """One button per actual file, labeled with its real filename, sending
-    that exact file via callback when tapped — never a reconstructed
-    lookup, so there's no path for the wrong file to go out."""
-    token = _store_results(files)
-    return [
-        [InlineKeyboardButton(
-            texts.FILE_BUTTON_LABEL.format(name=f['file_name'][:55], size=human_size(f['file_size'])),
-            callback_data=f"getfile|{token}|{i}",
-        )]
-        for i, f in enumerate(files)
-    ]
+@Client.on_callback_query(filters.regex(r'^pg\|'))
+async def on_paginate(bot: Client, cq: CallbackQuery):
+    _, token, direction = cq.data.split('|', 2)
+    entry = _RESULTS.get(token)
+    if not entry:
+        return await cq.answer("This result has expired — please search again.", show_alert=True)
+
+    ctx = entry["ctx"]
+    max_results = ctx["max_results"]
+    new_offset = ctx["offset"] + max_results if direction == "next" else max(0, ctx["offset"] - max_results)
+
+    files, _, total = await filesdb.get_search_results(
+        ctx["query"], max_results=max_results, offset=new_offset, season=ctx["season"], episode=ctx["episode"]
+    )
+    ctx["offset"] = new_offset
+    ctx["total"] = total
+    entry["files"] = files
+    entry["ts"] = time.time()
+
+    try:
+        await cq.message.edit_reply_markup(reply_markup=_build_markup(token, files, ctx))
+    except Exception as e:
+        logger.warning(f"Pagination edit failed: {e}")
+    await cq.answer()
+
+
+@Client.on_callback_query(filters.regex(r'^noop$'))
+async def on_noop(bot: Client, cq: CallbackQuery):
+    await cq.answer()
 
 
 @Client.on_callback_query(filters.regex(r'^getfile\|'))
@@ -189,10 +250,15 @@ async def on_get_file(bot: Client, cq: CallbackQuery):
         return await cq.answer("File not found.", show_alert=True)
 
     await cq.answer("Sending file…")
+    caption = f.get('caption')
+    if caption and len(caption) > 1024:  # Telegram's caption length cap
+        caption = caption[:1021] + "..."
     try:
         await bot.send_cached_media(
             chat_id=cq.message.chat.id,
             file_id=f['file_id'],
+            caption=caption,
+            parse_mode=enums.ParseMode.HTML,
             protect_content=info.PROTECT_CONTENT,
         )
     except Exception as e:
@@ -208,10 +274,13 @@ async def _show_result(bot: Client, message: Message, candidate: dict, clean_que
     chat_id = reply_chat or message.chat.id
     kind = candidate["kind"]  # 'movie' or 'series'
     title = candidate["title"]
+    max_results = info.MAX_RESULTS
 
-    files, _, total = await filesdb.get_search_results(title, max_results=info.MAX_RESULTS, season=season, episode=episode)
+    effective_query = title
+    files, _, total = await filesdb.get_search_results(title, max_results=max_results, offset=0, season=season, episode=episode)
     if not files:
-        files, _, total = await filesdb.get_search_results(clean_query, max_results=info.MAX_RESULTS, season=season, episode=episode)
+        effective_query = clean_query
+        files, _, total = await filesdb.get_search_results(clean_query, max_results=max_results, offset=0, season=season, episode=episode)
     if not files:
         return await bot.send_message(chat_id, texts.NO_FILES_FOUND.format(query=title))
 
@@ -222,11 +291,13 @@ async def _show_result(bot: Client, message: Message, candidate: dict, clean_que
 
     entry = await backend.find_entry(kind, candidate["tmdb_id"], title)
     website_part = ""
+    extra_buttons = []
     if entry:
         link = backend.website_link(kind, entry)
         from utils.shortlink import shorten
-        link = await shorten(link)
-        website_part = texts.WEBSITE_LINE.format(link=link)
+        short_link = await shorten(link)
+        website_part = texts.WEBSITE_LINE.format(link=short_link)
+        extra_buttons = [[InlineKeyboardButton("🌐 Watch on SC Files", url=link)]]
     else:
         await _notify_admin_missing(bot, candidate)
 
@@ -242,9 +313,8 @@ async def _show_result(bot: Client, message: Message, candidate: dict, clean_que
         website_part=website_part,
     ) + ep_note
 
-    buttons = _file_buttons(files)
-    if entry:
-        buttons.append([InlineKeyboardButton("🌐 Watch on SC Files", url=backend.website_link(kind, entry))])
+    token, ctx = _new_result_entry(files, effective_query, season, episode, 0, max_results, total, extra_buttons)
+    markup = _build_markup(token, files, ctx)
 
     photo_buf = io.BytesIO(poster_bytes)
     photo_buf.name = "poster.png"
@@ -252,7 +322,7 @@ async def _show_result(bot: Client, message: Message, candidate: dict, clean_que
         chat_id,
         photo=photo_buf,
         caption=caption,
-        reply_markup=InlineKeyboardMarkup(buttons),
+        reply_markup=markup,
     )
 
 

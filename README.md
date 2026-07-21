@@ -227,3 +227,28 @@ This is the second time a method assumed to exist on `Client` (`iter_messages`, 
 **Root cause:** once a result had more than 6 files, they got collapsed into one button per quality label (`720P (6 files)`), but that button could only actually link to *one* file_id — so tapping it sent an arbitrary pick from that quality bucket, not necessarily the one implied. That grouping is gone: every file now gets its own button with its real filename, always, no matter how many files there are.
 
 **Also changed how tapping a button delivers the file**, closer to how VJ-FILTER-BOT does it: instead of a `t.me/bot?start=file_<id>` deep link (which re-enters through `/start` and re-looks-up the file), each button's `callback_data` is an exact index into that exact search result list, and the file is sent straight into whichever chat you searched in (group or PM) via `send_cached_media`. There's no reconstruction step in between — the button *is* the file, not a link to look it up again — so there's no path left for a mismatch. Result caches live for an hour (`_RESULTS_TTL`) and expire gracefully with a "please search again" if a button is tapped after that.
+
+---
+
+## v8 additions
+
+### Captions now sent with the file
+The caption stored at index time (from `Media.caption`) was already in the DB but never actually attached when a file was delivered. Both delivery paths — the callback-based buttons in search results and the legacy `/start?start=file_<id>` deep link — now send it back as the file's caption (HTML-parsed, truncated to Telegram's 1024-char caption limit if needed).
+
+### Album/media-group indexing
+Telegram represents "several files sent together" (an album) as multiple separate messages sharing a `media_group_id` — but **only one item in the group actually carries the caption text**; the rest arrive with `caption = None`. Both `/index` and the real-time `CHANNELS` auto-indexer now detect this (`media_group_id` present, own caption empty) and pull the caption from whichever item in the group has it, via `get_media_group()`, cached per group so it's only fetched once no matter how many files are in that album. Every file from an album post is now searchable by that shared caption text, not just the one message that technically carried it.
+
+Also added `.gif`/animation files (`MessageMediaType.ANIMATION`) to both indexing paths — previously only video/audio/document were indexed.
+
+---
+
+## v9: pagination, recency sorting, substring-match fix
+
+### Pagination
+Search results were always capped at `MAX_RESULTS` (10) with no way to see the rest, even when the header said "Found 54 files". Every result message (both the plain file list and the poster+caption result) now gets a `◀️ Prev  📄 2/6  Next ▶️` row whenever there are more matches than fit on one page. Tapping Next/Prev edits the same message's buttons in place (no new message spam) and re-runs the same underlying search at the new offset — including correctly across the boundary between the "combined match" and "individual word" passes, so page numbers stay accurate no matter which pass a given page's results come from.
+
+### Newest files first
+Results were sorted by MongoDB's `$natural` order, which approximates insertion order but isn't a real guarantee, and doesn't reflect the file's actual original post date if a channel was ever backfilled out of order. Added two real fields to every indexed file: `file_date` (the message's original timestamp in its source channel) and `indexed_at` (when this bot saved it, as a fallback). Both `/index` and the real-time `CHANNELS` auto-indexer now capture `file_date`, and search results sort by it (newest first), falling back to `indexed_at` for any ties or for files indexed before this update (which won't have a `file_date` yet — they'll just sort to the end until re-indexed).
+
+### Fixed: "Blast" matching "Blasters"/"Blastor"
+The combined-word match regex only required a word *boundary before* each search word, not after — so "blast" matched as a prefix of "blasters" or "blastor". Added the trailing boundary; searching "Blast" now only matches files where "blast" appears as its own whole word (still matches fine inside names like `Blast.2023.1080p.mkv`, since normalization already turns punctuation into word boundaries).

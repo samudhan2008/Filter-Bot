@@ -1,6 +1,6 @@
 import logging
 
-from pyrogram import Client, filters
+from pyrogram import Client, filters, enums
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 import info
@@ -45,10 +45,15 @@ async def deliver_file(bot: Client, message: Message, file_id: str):
     doc = await filesdb.get_file_by_id(file_id)
     if not doc:
         return await message.reply("❌ File not found — it may have been removed.")
+    caption = doc.caption
+    if caption and len(caption) > 1024:
+        caption = caption[:1021] + "..."
     try:
         await bot.send_cached_media(
             chat_id=message.chat.id,
             file_id=file_id,
+            caption=caption,
+            parse_mode=enums.ParseMode.HTML,
             protect_content=info.PROTECT_CONTENT,
         )
     except Exception as e:
