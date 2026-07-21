@@ -112,25 +112,33 @@ def _draw_title_text(canvas: Image.Image, title: str) -> Image.Image:
 
 def _composite_sync(title: str, backdrop_bytes, logo_bytes) -> bytes:
     """The actual CPU-bound work — run via asyncio.to_thread so it doesn't
-    block the event loop."""
+    block the event loop. Explicitly closes/frees each intermediate image
+    buffer rather than relying on GC timing, since a burst of concurrent
+    searches can otherwise pile up several uncollected multi-MB bitmaps at
+    once on a memory-constrained instance."""
+    base = None
     if backdrop_bytes:
         try:
-            base = _fit_backdrop(Image.open(io.BytesIO(backdrop_bytes)))
+            with Image.open(io.BytesIO(backdrop_bytes)) as src:
+                base = _fit_backdrop(src)
         except Exception:
-            base = Image.new("RGB", CANVAS_SIZE, (20, 20, 20))
-    else:
+            base = None
+    if base is None:
         base = Image.new("RGB", CANVAS_SIZE, (20, 20, 20))
 
     canvas = _add_gradient(base)
+    base.close()
 
     if logo_bytes:
         try:
-            logo = Image.open(io.BytesIO(logo_bytes)).convert("RGBA")
+            with Image.open(io.BytesIO(logo_bytes)) as logo_src:
+                logo = logo_src.convert("RGBA")
             max_w, max_h = int(CANVAS_SIZE[0] * 0.55), int(CANVAS_SIZE[1] * 0.32)
             ratio = min(max_w / logo.width, max_h / logo.height, 1.0)
             logo = logo.resize((int(logo.width * ratio), int(logo.height * ratio)), Image.LANCZOS)
             pos = (60, CANVAS_SIZE[1] - logo.height - 60)
             canvas.paste(logo, pos, logo)
+            logo.close()
         except Exception as e:
             logger.warning(f"Logo composite failed, falling back to text: {e}")
             canvas = _draw_title_text(canvas, title)
@@ -139,8 +147,14 @@ def _composite_sync(title: str, backdrop_bytes, logo_bytes) -> bytes:
 
     buf = io.BytesIO()
     canvas.convert("RGB").save(buf, format="PNG")
+    canvas.close()
     buf.seek(0)
-    return buf.read()
+    data = buf.read()
+    buf.close()
+
+    import gc
+    gc.collect()
+    return data
 
 
 async def build_poster(title: str, backdrop_path: str, logo_url: str = None, tmdb_id=None, kind: str = "movie") -> bytes:

@@ -91,6 +91,12 @@ MAX_RESULTS = int(environ.get('MAX_RESULTS', '10'))
 SUGGEST_MATCH_CUTOFF = float(environ.get('SUGGEST_MATCH_CUTOFF', '0.55'))  # difflib similarity, 0-1
 SUGGEST_MAX_RESULTS = int(environ.get('SUGGEST_MAX_RESULTS', '5'))
 PORT = environ.get('PORT', '8080')
+# Pyrogram's update-dispatch worker pool. 50 (the old default) is overkill
+# for a small instance and adds baseline memory overhead for headroom this
+# bot doesn't need — most updates here are quick DB lookups, not long CPU
+# work. Bump via env if you're actually seeing update-processing backlog
+# under real load; that's a different symptom than an OOM kill.
+WORKERS = int(environ.get('WORKERS', '8'))
 USE_CAPTION_FILTER = is_enabled(environ.get('USE_CAPTION_FILTER', 'True'), True)
 
 SUPPORT_CHAT = environ.get('SUPPORT_CHAT', '')

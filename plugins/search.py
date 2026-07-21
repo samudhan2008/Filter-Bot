@@ -11,7 +11,7 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, 
 
 import info
 from database import filesdb, usersdb, backend
-from plugins.group_auth import group_is_allowed
+from plugins.group_auth import group_is_allowed, _is_group_admin
 from plugins.force_sub import is_subscribed, fsub_markup
 from utils import tmdb, poster, query as queryutil, texts
 from utils.filesize import human_size
@@ -28,6 +28,11 @@ _PENDING_TTL = 600
 # enough of the original search to refetch the next/previous page).
 _RESULTS = {}
 _RESULTS_TTL = 3600
+
+
+# token -> True once cancelled. Short-lived; cleared as soon as the search
+# either finishes or is cancelled, so this never needs its own GC pass.
+_CANCEL_FLAGS = {}
 
 
 def _new_token(chat_id, msg_id):
@@ -92,7 +97,26 @@ def _build_markup(token, files, ctx):
     rows = _file_button_rows(token, files)
     rows.extend(ctx.get("extra_buttons", []))
     rows.extend(_pagination_row(token, ctx["offset"], ctx["max_results"], ctx["total"]))
+    rows.append([InlineKeyboardButton("✖️ Close", callback_data="close")])
     return InlineKeyboardMarkup(rows)
+
+
+@Client.on_callback_query(filters.regex(r'^close$'))
+async def on_close_result(bot: Client, cq: CallbackQuery):
+    """Deletes the result message — but only for a bot admin, or (in a
+    group) that group's own admins/creator. Anyone else tapping it just
+    gets told no, the message stays."""
+    is_allowed = cq.from_user.id in info.ADMINS
+    if not is_allowed and cq.message.chat.type != ChatType.PRIVATE:
+        is_allowed = await _is_group_admin(bot, cq.message.chat.id, cq.from_user.id)
+    if not is_allowed:
+        return await cq.answer("Only an admin can close this.", show_alert=True)
+    try:
+        await cq.message.delete()
+    except Exception as e:
+        logger.warning(f"Could not delete message on close: {e}")
+        return await cq.answer("Couldn't delete — I may be missing delete permission here.", show_alert=True)
+    await cq.answer()
 
 
 @Client.on_message(
@@ -141,7 +165,22 @@ async def on_search_text(bot: Client, message: Message):
             await message.reply(texts.NO_FILES_FOUND.format(query=raw_query))
         return
 
+    cancel_token = uuid.uuid4().hex[:10]
+    _CANCEL_FLAGS[cancel_token] = False
+    status_msg = await message.reply(
+        "🔎 Checking TMDB for a match…",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancelsearch|{cancel_token}")]]),
+    )
+
     candidates = await tmdb.search_multi(clean_query, year=year)
+
+    if _CANCEL_FLAGS.pop(cancel_token, False):
+        return  # user cancelled — on_cancel_search already updated the status message
+    _CANCEL_FLAGS.pop(cancel_token, None)
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
 
     if not candidates:
         return await _send_plain_results(bot, message, clean_query, season, episode)
@@ -171,6 +210,19 @@ def _is_unambiguous(candidates):
     """Per the agreed UX: only skip the picker when there's truly one option
     left (e.g. after a year filter narrowed it down)."""
     return len(candidates) <= 1
+
+
+@Client.on_callback_query(filters.regex(r'^cancelsearch\|'))
+async def on_cancel_search(bot: Client, cq: CallbackQuery):
+    """Anyone can cancel a search in progress — this isn't gated to the
+    original requester or to admins, unlike the Close button below."""
+    _, token = cq.data.split('|', 1)
+    _CANCEL_FLAGS[token] = True
+    try:
+        await cq.message.edit_text("❌ Search cancelled.")
+    except Exception:
+        pass
+    await cq.answer("Cancelled.")
 
 
 @Client.on_callback_query(filters.regex(r'^pick\|'))
@@ -338,12 +390,21 @@ async def _show_result(bot: Client, message: Message, candidate: dict, clean_que
 
     photo_buf = io.BytesIO(poster_bytes)
     photo_buf.name = "poster.png"
-    await bot.send_photo(
-        chat_id,
-        photo=photo_buf,
-        caption=caption,
-        reply_markup=markup,
-    )
+    try:
+        await bot.send_photo(
+            chat_id,
+            photo=photo_buf,
+            caption=caption,
+            reply_markup=markup,
+        )
+    finally:
+        # Free the in-memory poster bytes as soon as Telegram has it — no
+        # reason to hold a ~1MB+ buffer alive for the rest of this task's
+        # lifetime. (The on-disk poster cache in utils/poster.py is a
+        # separate, much smaller, deliberately-kept cache for speed on
+        # repeat searches — this only clears the one-off send buffer.)
+        photo_buf.close()
+        del poster_bytes
 
 
 async def _notify_admin_missing(bot: Client, candidate: dict):

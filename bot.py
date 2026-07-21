@@ -39,7 +39,7 @@ class SCFilesBot(Client):
             api_hash=info.API_HASH,
             bot_token=info.BOT_TOKEN,
             plugins={"root": "plugins"},
-            workers=50,
+            workers=info.WORKERS,
             sleep_threshold=60,
         )
 

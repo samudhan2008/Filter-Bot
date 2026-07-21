@@ -269,3 +269,32 @@ None of this changes MongoDB query cost (still governed by `USE_MONGO_TEXT_SEARC
 
 ### Fixed: files landing in the group instead of PM
 Tapping a file button now always delivers into the **clicking user's own PM**, regardless of where the search happened — matching the intended behavior. If the bot can't message them (they haven't started it in PM yet), it shows an alert asking them to start the bot first rather than silently dropping the file into the group.
+
+---
+
+## v11: OOM crash during search
+
+The Koyeb logs showed a clean startup followed by `Application exited with code 9` (SIGKILL — the OS/container runtime killing the process for using too much memory) right after a search was attempted. A few changes to cut peak memory during the poster-building step, which is the part of a search request that actually allocates meaningful memory:
+
+- **TMDB logo images were being fetched at `original` size.** TMDB's "original" tier can be several MB and several thousand pixels on a side for some titles — once Pillow decompresses that into an in-memory bitmap, a single logo could balloon to tens of MB. Switched to `w500`, which is already larger than what gets composited onto the poster (logos are scaled down to ~700px max width on the 1280×720 canvas anyway), so there's no visible quality loss.
+- **Poster compositing now explicitly closes each intermediate image buffer** (`with Image.open(...)`, `.close()` on the backdrop/logo/canvas) and forces a `gc.collect()` at the end of the compositing step, instead of waiting on Python's normal GC timing. On a memory-constrained instance, a burst of a few concurrent searches could otherwise leave several uncollected multi-MB bitmaps alive at once.
+- **Pyrogram's worker pool dropped from a hardcoded 50 to a configurable `WORKERS` env var, default 8.** 50 concurrent update-handling workers is sized for much higher traffic than a small instance needs, and each one carries baseline overhead. Bump it via env if you're actually seeing update-processing backlog under real load (a different symptom — messages queuing up — not a crash).
+
+**Worth checking on your end too:** if the instance is on Koyeb's smallest/free tier (often 512MB or less), Python + Pyrogram + MongoDB driver + Pillow's baseline footprint can already eat a meaningful chunk of that before any request-specific work happens. These changes reduce the *peak* usage during a search, but if crashes continue after this, the next step is either bumping the instance size a notch or watching Koyeb's memory graph during a search to see exactly where the spike lands.
+
+---
+
+## v12: image sizing, buffer cleanup, cancel/close buttons
+
+### Image sizes
+- **Backdrop**: `w1280` → `w780`. This is a real TMDB size (their backdrop tiers are `w300/w780/w1280/original`), noticeably lighter, and close to what was asked for.
+- **Logo**: stayed at `w500`, *not* `w750` — worth knowing why: TMDB's logo tiers are only `w45/w92/w154/w185/w300/w500/original`. There's no `w750` (or anything between `w500` and `original`) for logos specifically, so `w500` is already the largest bounded option short of jumping back to the multi-MB `original` size we were trying to get away from.
+
+### Buffer cleanup after sending
+The poster's in-memory bytes (and the `BytesIO` wrapper around them) are now explicitly closed/deleted right after `send_photo` returns, instead of just falling out of scope for GC to notice eventually. **Note:** this only clears the one-off send buffer for that request — the on-disk poster cache (`POSTER_CACHE_DIR`, keyed by tmdb_id) is left alone, since that's a small, deliberate cache that's what makes repeat searches for the same title fast. If you actually meant the disk cache should be cleared after every send too, say so — that's a one-line change, just a different (and slower) tradeoff.
+
+### Cancel button while checking TMDB
+Right before the bot calls TMDB, it now sends a "🔎 Checking TMDB for a match…" status message with a **❌ Cancel** button — tappable by anyone, not just the requester or an admin. Cancelling stops the search from proceeding to a result once TMDB responds.
+
+### Close button on results, admin-only
+Every result message (both the plain file list and the poster+caption result, including every page while paginating) now ends with a **✖️ Close** button. Tapping it deletes the message, but only if the tapper is a bot admin (`ADMINS`) or — in a group — one of that group's own Telegram admins/creator. Anyone else gets a "only an admin can close this" alert and the message stays.

@@ -147,12 +147,12 @@ async def get_logo_url(tmdb_id: int, kind: str):
         return None
     logos.sort(key=lambda l: (l.get("iso_639_1") != "en", -l.get("width", 0)))
     best = logos[0]
-    url = f"{info.TMDB_IMG_BASE}/original{best['file_path']}"
+    url = f"{info.TMDB_IMG_BASE}/w500{best['file_path']}"
     _logo_cache.set(cache_key, url)
     return url
 
 
-def backdrop_url(path: str, size="w1280"):
+def backdrop_url(path: str, size="w780"):
     if not path:
         return None
     return f"{info.TMDB_IMG_BASE}/{size}{path}"
