@@ -298,3 +298,21 @@ Right before the bot calls TMDB, it now sends a "🔎 Checking TMDB for a match�
 
 ### Close button on results, admin-only
 Every result message (both the plain file list and the poster+caption result, including every page while paginating) now ends with a **✖️ Close** button. Tapping it deletes the message, but only if the tapper is a bot admin (`ADMINS`) or — in a group — one of that group's own Telegram admins/creator. Anyone else gets a "only an admin can close this" alert and the message stays.
+
+---
+
+## v13: "This result has expired" fix — moved search state out of process memory
+
+### Root cause
+The pagination/file-delivery/disambiguation/cancel state (`_RESULTS`, `_PENDING`, `_CANCEL_FLAGS` in `plugins/search.py`, and `_PENDING_INDEX` in `plugins/index.py`) all lived in plain Python dicts, in the bot process's memory. That meant:
+- **Any restart wipes everything instantly** — a redeploy, a crash, or one of the OOM kills from a couple rounds back. A button from 5 seconds before a restart would show "expired" even though nothing about it had actually gone stale.
+- **Running more than one instance would break the same way** — an instance handling the callback wouldn't have the token an *different* instance created when it sent the result.
+
+### Fix
+All four moved into MongoDB (`database/statedb.py`), keyed the same way (by token), but now surviving restarts and shared correctly across instances:
+- `search_results` — file-delivery + pagination state. TTL: `RESULTS_TTL` (default 3600s).
+- `search_pending` — disambiguation picker candidates. TTL: `PENDING_TTL` (default 600s).
+- `search_cancel` — "checking TMDB" cancel flags. TTL: 180s (short-lived by nature).
+- `index_pending` — `/index`'s "waiting for the channel link" state. TTL: `INDEX_WAIT_TTL` (default 300s).
+
+Each collection has a TTL index on `created_at`, so Mongo expires stale entries on its own — no more manual GC sweep needed in the bot code. If you still see "expired" after this, it's a genuinely stale token (older than its TTL), not a restart wiping things out.

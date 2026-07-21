@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import re
-import time
 
 from pyrogram import Client, filters, enums
 from pyrogram.errors.exceptions.bad_request_400 import ChannelInvalid, UsernameInvalid, UsernameNotModified
@@ -9,18 +8,11 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message
 
 import info
 from database.filesdb import save_files_batch
+from database import statedb
 
 logger = logging.getLogger(__name__)
 _lock = asyncio.Lock()
 _cancel_flag = {"cancel": False}
-
-# admin_id -> {"ts": float}  — tracks "we asked this admin for a channel
-# link, waiting for their next message". Deliberately not using
-# Client.ask()/.listen(): this pyrofork build doesn't actually implement
-# them (confirmed by testing — calling ask() raised AttributeError, and
-# with no visible reply, which made the whole command look silently dead).
-_PENDING_INDEX = {}
-_PENDING_TTL = 300
 
 BATCH_SIZE = 200  # bulk-write batch; larger batches = far fewer DB round trips
 LINK_RE = re.compile(r"(https://)?(t\.me/|telegram\.me/|telegram\.dog/)(c/)?(\d+|[a-zA-Z_0-9]+)/(\d+)$")
@@ -46,19 +38,14 @@ async def _iter_messages_by_id(bot: Client, chat_id, last_msg_id: int, batch_siz
         current_id -= batch_size
 
 
-def _gc_pending():
-    now = time.time()
-    dead = [uid for uid, v in _PENDING_INDEX.items() if now - v["ts"] > _PENDING_TTL]
-    for uid in dead:
-        _PENDING_INDEX.pop(uid, None)
-
-
 @Client.on_message(filters.command('index') & filters.user(info.ADMINS))
 async def index_cmd(bot: Client, message: Message):
     """
     /index — no argument: ask for the channel link/forward as the *next*
-    message from this admin (tracked via _PENDING_INDEX, not a blocking
-    listener). /index <link> — skip the prompt and go straight to it.
+    message from this admin (tracked in Mongo, not a blocking listener —
+    survives a bot restart between the prompt and the admin's reply,
+    unlike the old in-memory version). /index <link> — skip the prompt
+    and go straight to it.
     """
     parts = message.text.split(maxsplit=1)
     if len(parts) > 1 and parts[1].strip():
@@ -67,8 +54,7 @@ async def index_cmd(bot: Client, message: Message):
     if _lock.locked():
         return await message.reply("⏳ Another indexing job is already running. Try again later.")
 
-    _gc_pending()
-    _PENDING_INDEX[message.from_user.id] = {"ts": time.time(), "chat_id": message.chat.id}
+    await statedb.set_index_wait(message.from_user.id, message.chat.id)
     await message.reply(
         "📥 Send the channel's last message link, or forward the last message from it, as your "
         "next message here.\n\n(Or next time, skip this step: <code>/index &lt;link&gt;</code>)"
@@ -82,11 +68,9 @@ async def index_link_reply(bot: Client, message: Message):
     """Catches an admin's reply to the /index prompt above. Runs in group=-1
     so it's checked before the general search handler, and only actually
     does anything if that admin has a pending /index request."""
-    _gc_pending()
-    pending = _PENDING_INDEX.get(message.from_user.id)
+    pending = await statedb.pop_index_wait(message.from_user.id)
     if not pending:
         return  # not awaiting anything from this admin — let normal handlers (search) run
-    _PENDING_INDEX.pop(message.from_user.id, None)
 
     if message.text:
         await _handle_index_input(bot, message, message.text.strip(), reply_to=message)

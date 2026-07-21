@@ -90,6 +90,13 @@ PROTECT_CONTENT = is_enabled(environ.get('PROTECT_CONTENT', 'False'), False)
 MAX_RESULTS = int(environ.get('MAX_RESULTS', '10'))
 SUGGEST_MATCH_CUTOFF = float(environ.get('SUGGEST_MATCH_CUTOFF', '0.55'))  # difflib similarity, 0-1
 SUGGEST_MAX_RESULTS = int(environ.get('SUGGEST_MAX_RESULTS', '5'))
+
+# How long a search's in-flight state (result pages / disambiguation picks)
+# stays valid, stored in Mongo (see database/statedb.py) so it survives a
+# bot restart instead of living only in process memory.
+RESULTS_TTL = int(environ.get('RESULTS_TTL', '3600'))   # file/pagination buttons
+PENDING_TTL = int(environ.get('PENDING_TTL', '600'))     # disambiguation picker buttons
+INDEX_WAIT_TTL = int(environ.get('INDEX_WAIT_TTL', '300'))  # /index "waiting for channel link" window
 PORT = environ.get('PORT', '8080')
 # Pyrogram's update-dispatch worker pool. 50 (the old default) is overkill
 # for a small instance and adds baseline memory overhead for headroom this

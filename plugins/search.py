@@ -2,7 +2,6 @@ import asyncio
 import io
 import logging
 import math
-import time
 import uuid
 
 from pyrogram import Client, filters, enums
@@ -10,7 +9,7 @@ from pyrogram.enums import ChatType
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 import info
-from database import filesdb, usersdb, backend
+from database import filesdb, usersdb, backend, statedb
 from plugins.group_auth import group_is_allowed, _is_group_admin
 from plugins.force_sub import is_subscribed, fsub_markup
 from utils import tmdb, poster, query as queryutil, texts
@@ -18,54 +17,22 @@ from utils.filesize import human_size
 
 logger = logging.getLogger(__name__)
 
-# token -> {"query": str, "candidates": [...], "ts": float}
-_PENDING = {}
-_PENDING_TTL = 600
-
-# token -> {"files": [...], "ctx": {...}, "ts": float}  — backs both the
-# file-delivery buttons (exact index into "files", no reconstruction, so
-# there's no path for the wrong file to go out) and pagination (ctx carries
-# enough of the original search to refetch the next/previous page).
-_RESULTS = {}
-_RESULTS_TTL = 3600
-
-
-# token -> True once cancelled. Short-lived; cleared as soon as the search
-# either finishes or is cancelled, so this never needs its own GC pass.
-_CANCEL_FLAGS = {}
-
-
 def _new_token(chat_id, msg_id):
     return f"{chat_id}_{msg_id}"
 
 
-def _gc_pending():
-    now = time.time()
-    dead = [t for t, v in _PENDING.items() if now - v["ts"] > _PENDING_TTL]
-    for t in dead:
-        _PENDING.pop(t, None)
-
-
-def _gc_results():
-    now = time.time()
-    dead = [t for t, v in _RESULTS.items() if now - v["ts"] > _RESULTS_TTL]
-    for t in dead:
-        _RESULTS.pop(t, None)
-
-
-def _new_result_entry(files, query, season, episode, offset, max_results, total, extra_buttons=None):
+async def _new_result_entry(files, query, season, episode, offset, max_results, total, extra_buttons=None):
     """Stores one page of results + enough search context to fetch the next
-    one. Re-used (same token) across pagination clicks on the same message
-    — we just overwrite "files"/"ctx" in place and edit the message's
-    buttons, rather than sending a new message each page."""
-    _gc_results()
+    one, in Mongo (survives restarts). Re-used (same token) across
+    pagination clicks on the same message — we overwrite in place and edit
+    the message's buttons, rather than sending a new message each page."""
     token = uuid.uuid4().hex[:12]
     ctx = {
         "query": query, "season": season, "episode": episode,
         "offset": offset, "max_results": max_results, "total": total,
         "extra_buttons": extra_buttons or [],
     }
-    _RESULTS[token] = {"files": files, "ctx": ctx, "ts": time.time()}
+    await statedb.store_results(token, files, ctx)
     return token, ctx
 
 
@@ -166,7 +133,6 @@ async def on_search_text(bot: Client, message: Message):
         return
 
     cancel_token = uuid.uuid4().hex[:10]
-    _CANCEL_FLAGS[cancel_token] = False
     status_msg = await message.reply(
         "🔎 Checking TMDB for a match…",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"cancelsearch|{cancel_token}")]]),
@@ -174,9 +140,8 @@ async def on_search_text(bot: Client, message: Message):
 
     candidates = await tmdb.search_multi(clean_query, year=year)
 
-    if _CANCEL_FLAGS.pop(cancel_token, False):
+    if await statedb.pop_cancelled(cancel_token):
         return  # user cancelled — on_cancel_search already updated the status message
-    _CANCEL_FLAGS.pop(cancel_token, None)
     try:
         await status_msg.delete()
     except Exception:
@@ -191,10 +156,10 @@ async def on_search_text(bot: Client, message: Message):
     if len(candidates) == 1 or _is_unambiguous(candidates):
         return await _show_result(bot, message, candidates[0], clean_query, season, episode)
 
-    _gc_pending()
     token = _new_token(message.chat.id, message.id)
-    _PENDING[token] = {"query": clean_query, "candidates": candidates[:8], "season": season,
-                        "episode": episode, "ts": time.time()}
+    await statedb.store_pending(token, {
+        "query": clean_query, "candidates": candidates[:8], "season": season, "episode": episode,
+    })
 
     buttons = []
     for i, c in enumerate(candidates[:8]):
@@ -217,7 +182,7 @@ async def on_cancel_search(bot: Client, cq: CallbackQuery):
     """Anyone can cancel a search in progress — this isn't gated to the
     original requester or to admins, unlike the Close button below."""
     _, token = cq.data.split('|', 1)
-    _CANCEL_FLAGS[token] = True
+    await statedb.set_cancelled(token)
     try:
         await cq.message.edit_text("❌ Search cancelled.")
     except Exception:
@@ -228,7 +193,7 @@ async def on_cancel_search(bot: Client, cq: CallbackQuery):
 @Client.on_callback_query(filters.regex(r'^pick\|'))
 async def on_pick_candidate(bot: Client, cq: CallbackQuery):
     _, token, idx = cq.data.split('|', 2)
-    pending = _PENDING.get(token)
+    pending = await statedb.get_pending(token)
     if not pending:
         return await cq.answer("This search expired, please search again.", show_alert=True)
     try:
@@ -252,7 +217,7 @@ async def _send_plain_results(bot: Client, message: Message, clean_query: str, s
     if not files:
         return await message.reply(texts.NO_FILES_FOUND.format(query=clean_query))
 
-    token, ctx = _new_result_entry(files, clean_query, season, episode, 0, max_results, total)
+    token, ctx = await _new_result_entry(files, clean_query, season, episode, 0, max_results, total)
     markup = _build_markup(token, files, ctx)
     await message.reply(
         f"📦 Found <b>{total}</b> file(s) for <b>{clean_query}</b>:",
@@ -263,7 +228,7 @@ async def _send_plain_results(bot: Client, message: Message, clean_query: str, s
 @Client.on_callback_query(filters.regex(r'^pg\|'))
 async def on_paginate(bot: Client, cq: CallbackQuery):
     _, token, direction = cq.data.split('|', 2)
-    entry = _RESULTS.get(token)
+    entry = await statedb.get_results(token)
     if not entry:
         return await cq.answer("This result has expired — please search again.", show_alert=True)
 
@@ -276,8 +241,7 @@ async def on_paginate(bot: Client, cq: CallbackQuery):
     )
     ctx["offset"] = new_offset
     ctx["total"] = total
-    entry["files"] = files
-    entry["ts"] = time.time()
+    await statedb.update_results(token, files, ctx)
 
     try:
         await cq.message.edit_reply_markup(reply_markup=_build_markup(token, files, ctx))
@@ -294,7 +258,7 @@ async def on_noop(bot: Client, cq: CallbackQuery):
 @Client.on_callback_query(filters.regex(r'^getfile\|'))
 async def on_get_file(bot: Client, cq: CallbackQuery):
     _, token, idx = cq.data.split('|', 2)
-    entry = _RESULTS.get(token)
+    entry = await statedb.get_results(token)
     if not entry:
         return await cq.answer("This result has expired — please search again.", show_alert=True)
     try:
@@ -385,7 +349,7 @@ async def _show_result(bot: Client, message: Message, candidate: dict, clean_que
         website_part=website_part,
     ) + ep_note
 
-    token, ctx = _new_result_entry(files, effective_query, season, episode, 0, max_results, total, extra_buttons)
+    token, ctx = await _new_result_entry(files, effective_query, season, episode, 0, max_results, total, extra_buttons)
     markup = _build_markup(token, files, ctx)
 
     photo_buf = io.BytesIO(poster_bytes)
