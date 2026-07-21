@@ -2,8 +2,17 @@
 Builds the landscape poster shown with every search result:
 TMDB backdrop + a dark gradient at the bottom + the title logo overlaid
 (or, if TMDB has no logo for that title, the title drawn as text instead).
+
+Two speed changes vs the first version:
+1. Backdrop + logo are fetched *concurrently* (asyncio.gather) instead of
+   one after the other — halves the network wait on a cache miss.
+2. The actual PIL compositing (resizing, gradient, pasting) is CPU-bound
+   and synchronous; it now runs in a worker thread (asyncio.to_thread)
+   instead of directly in the event loop, so building one poster doesn't
+   stall every other concurrent request the bot is handling.
 """
 
+import asyncio
 import io
 import logging
 import os
@@ -14,10 +23,17 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 import info
 from utils import tmdb
+from utils.http import get_session
 
 logger = logging.getLogger(__name__)
 
 os.makedirs(info.POSTER_CACHE_DIR, exist_ok=True)
+
+CANVAS_SIZE = (1280, 720)
+FONT_PATH_CANDIDATES = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+]
 
 
 def _cache_path(tmdb_id, kind: str) -> str:
@@ -44,12 +60,6 @@ def _store_cache(tmdb_id, kind: str, data: bytes):
     except Exception as e:
         logger.warning(f"Could not write poster cache: {e}")
 
-CANVAS_SIZE = (1280, 720)
-FONT_PATH_CANDIDATES = [
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-]
-
 
 def _load_font(size):
     for path in FONT_PATH_CANDIDATES:
@@ -64,11 +74,11 @@ async def _fetch_bytes(url: str):
     if not url:
         return None
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                if resp.status != 200:
-                    return None
-                return await resp.read()
+        session = await get_session()
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                return None
+            return await resp.read()
     except Exception as e:
         logger.warning(f"Failed to fetch image {url}: {e}")
         return None
@@ -91,17 +101,18 @@ def _add_gradient(base: Image.Image) -> Image.Image:
     return Image.alpha_composite(base.convert("RGBA"), overlay)
 
 
-async def build_poster(title: str, backdrop_path: str, logo_url: str = None, tmdb_id=None, kind: str = "movie") -> bytes:
-    """Returns PNG bytes ready to send as a photo. Cached on disk per
-    (kind, tmdb_id) — compositing is the slowest part of a search response,
-    so a repeat search for the same title should never redo it."""
-    if tmdb_id is not None:
-        cached = _cached(tmdb_id, kind)
-        if cached is not None:
-            return cached
+def _draw_title_text(canvas: Image.Image, title: str) -> Image.Image:
+    draw = ImageDraw.Draw(canvas)
+    font = _load_font(72)
+    x, y = 60, CANVAS_SIZE[1] - 140
+    draw.text((x + 3, y + 3), title, font=font, fill=(0, 0, 0, 180))
+    draw.text((x, y), title, font=font, fill=(255, 255, 255, 255))
+    return canvas
 
-    backdrop_bytes = await _fetch_bytes(tmdb.backdrop_url(backdrop_path)) if backdrop_path else None
 
+def _composite_sync(title: str, backdrop_bytes, logo_bytes) -> bytes:
+    """The actual CPU-bound work — run via asyncio.to_thread so it doesn't
+    block the event loop."""
     if backdrop_bytes:
         try:
             base = _fit_backdrop(Image.open(io.BytesIO(backdrop_bytes)))
@@ -112,7 +123,6 @@ async def build_poster(title: str, backdrop_path: str, logo_url: str = None, tmd
 
     canvas = _add_gradient(base)
 
-    logo_bytes = await _fetch_bytes(logo_url) if logo_url else None
     if logo_bytes:
         try:
             logo = Image.open(io.BytesIO(logo_bytes)).convert("RGBA")
@@ -130,17 +140,25 @@ async def build_poster(title: str, backdrop_path: str, logo_url: str = None, tmd
     buf = io.BytesIO()
     canvas.convert("RGB").save(buf, format="PNG")
     buf.seek(0)
-    data = buf.read()
+    return buf.read()
+
+
+async def build_poster(title: str, backdrop_path: str, logo_url: str = None, tmdb_id=None, kind: str = "movie") -> bytes:
+    """Returns PNG bytes ready to send as a photo. Cached on disk per
+    (kind, tmdb_id) — a repeat search for the same title skips all of this."""
+    if tmdb_id is not None:
+        cached = _cached(tmdb_id, kind)
+        if cached is not None:
+            return cached
+
+    backdrop_url_ = tmdb.backdrop_url(backdrop_path) if backdrop_path else None
+    backdrop_bytes, logo_bytes = await asyncio.gather(
+        _fetch_bytes(backdrop_url_),
+        _fetch_bytes(logo_url),
+    )
+
+    data = await asyncio.to_thread(_composite_sync, title, backdrop_bytes, logo_bytes)
+
     if tmdb_id is not None:
         _store_cache(tmdb_id, kind, data)
     return data
-
-
-def _draw_title_text(canvas: Image.Image, title: str) -> Image.Image:
-    draw = ImageDraw.Draw(canvas)
-    font = _load_font(72)
-    x, y = 60, CANVAS_SIZE[1] - 140
-    # simple shadow for legibility
-    draw.text((x + 3, y + 3), title, font=font, fill=(0, 0, 0, 180))
-    draw.text((x, y), title, font=font, fill=(255, 255, 255, 255))
-    return canvas

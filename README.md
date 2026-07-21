@@ -252,3 +252,20 @@ Results were sorted by MongoDB's `$natural` order, which approximates insertion 
 
 ### Fixed: "Blast" matching "Blasters"/"Blastor"
 The combined-word match regex only required a word *boundary before* each search word, not after — so "blast" matched as a prefix of "blasters" or "blastor". Added the trailing boundary; searching "Blast" now only matches files where "blast" appears as its own whole word (still matches fine inside names like `Blast.2023.1080p.mkv`, since normalization already turns punctuation into word boundaries).
+
+---
+
+## v10: speed + files-to-PM fix
+
+### Speed
+The biggest cost by far was invisible: **every single external call (TMDB, backend, poster images, shortlink) was opening a brand-new `aiohttp.ClientSession()`**, meaning a fresh TCP+TLS handshake per call instead of reusing a connection. That's now a single shared, connection-pooled session (`utils/http.py`) reused for the whole bot process. This alone should be the largest visible improvement.
+
+On top of that:
+- **Poster building** — backdrop and logo images are now fetched *concurrently* (`asyncio.gather`) instead of one after another, and the actual PIL compositing (CPU-bound, synchronous) now runs in a worker thread (`asyncio.to_thread`) instead of directly in the event loop — so building one poster no longer stalls every other concurrent search the bot is handling.
+- **TMDB movie+TV search** now runs both lookups concurrently instead of sequentially.
+- **Backend lookup** (`find_entry`) now runs *concurrently* with the poster build in `_show_result`, instead of waiting for the poster to finish first — its latency is now hidden behind the (longer) poster-building step rather than adding on top of it.
+
+None of this changes MongoDB query cost (still governed by `USE_MONGO_TEXT_SEARCH` — worth turning on if the file collection is large and regex scans still feel slow after this).
+
+### Fixed: files landing in the group instead of PM
+Tapping a file button now always delivers into the **clicking user's own PM**, regardless of where the search happened — matching the intended behavior. If the bot can't message them (they haven't started it in PM yet), it shows an alert asking them to start the bot first rather than silently dropping the file into the group.

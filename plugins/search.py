@@ -1,3 +1,4 @@
+import asyncio
 import io
 import logging
 import math
@@ -249,24 +250,37 @@ async def on_get_file(bot: Client, cq: CallbackQuery):
     except (IndexError, ValueError):
         return await cq.answer("File not found.", show_alert=True)
 
-    await cq.answer("Sending file…")
     caption = f.get('caption')
     if caption and len(caption) > 1024:  # Telegram's caption length cap
         caption = caption[:1021] + "..."
+
+    # Always deliver to the clicking user's own PM, never into the group the
+    # search happened in — regardless of where the button was pressed.
     try:
         await bot.send_cached_media(
-            chat_id=cq.message.chat.id,
+            chat_id=cq.from_user.id,
             file_id=f['file_id'],
             caption=caption,
             parse_mode=enums.ParseMode.HTML,
             protect_content=info.PROTECT_CONTENT,
         )
     except Exception as e:
-        logger.warning(f"send_cached_media failed: {e}")
-        await bot.send_message(
-            cq.message.chat.id,
+        logger.warning(f"Could not PM file to {cq.from_user.id}: {e}")
+        if cq.message.chat.type != ChatType.PRIVATE:
+            return await cq.answer(
+                "⚠️ I couldn't message you privately — please start me in PM first "
+                "(tap my name, hit Start), then tap this button again.",
+                show_alert=True,
+            )
+        return await cq.answer(
             "❌ Couldn't send that file — it may have expired. Please search again.",
+            show_alert=True,
         )
+
+    if cq.message.chat.type != ChatType.PRIVATE:
+        await cq.answer("✅ Sent to your PM — check your DMs!", show_alert=False)
+    else:
+        await cq.answer("Sending file…")
 
 
 async def _show_result(bot: Client, message: Message, candidate: dict, clean_query: str,
@@ -284,12 +298,18 @@ async def _show_result(bot: Client, message: Message, candidate: dict, clean_que
     if not files:
         return await bot.send_message(chat_id, texts.NO_FILES_FOUND.format(query=title))
 
-    logo_url = await tmdb.get_logo_url(candidate["tmdb_id"], kind)
+    # get_logo_url and find_entry are independent — kick both off now so
+    # find_entry's latency overlaps with the (longer) poster build below
+    # instead of adding on top of it.
+    logo_task = asyncio.create_task(tmdb.get_logo_url(candidate["tmdb_id"], kind))
+    entry_task = asyncio.create_task(backend.find_entry(kind, candidate["tmdb_id"], title))
+
+    logo_url = await logo_task
     poster_bytes = await poster.build_poster(
         title, candidate.get("backdrop_path"), logo_url, tmdb_id=candidate["tmdb_id"], kind=kind
     )
 
-    entry = await backend.find_entry(kind, candidate["tmdb_id"], title)
+    entry = await entry_task
     website_part = ""
     extra_buttons = []
     if entry:

@@ -16,6 +16,7 @@ import aiohttp
 import info
 from utils.cache import TTLCache
 from utils.netutil import retry_async, CircuitBreaker
+from utils.http import get_session
 
 logger = logging.getLogger(__name__)
 
@@ -64,19 +65,20 @@ async def search_multi(query: str, year: int = None, kind: str = None):
 
     candidates = []
     try:
-        async with aiohttp.ClientSession() as session:
-            kinds = [kind] if kind else ["movie", "tv"]
-            for k in kinds:
-                params = {"query": query, "include_adult": "false"}
-                if year:
-                    params["year" if k == "movie" else "first_air_date_year"] = year
-                data = await _get(session, f"/search/{k}", params)
-                if not data:
-                    continue
+        session = await get_session()
+        kinds = [kind] if kind else ["movie", "tv"]
+
+        async def _search_kind(k):
+            params = {"query": query, "include_adult": "false"}
+            if year:
+                params["year" if k == "movie" else "first_air_date_year"] = year
+            data = await _get(session, f"/search/{k}", params)
+            results = []
+            if data:
                 for r in data.get("results", [])[:8]:
                     title = r.get("title") or r.get("name") or ""
                     date = r.get("release_date") or r.get("first_air_date") or ""
-                    candidates.append({
+                    results.append({
                         "tmdb_id": r.get("id"),
                         "kind": "movie" if k == "movie" else "series",
                         "title": title,
@@ -86,6 +88,13 @@ async def search_multi(query: str, year: int = None, kind: str = None):
                         "poster_path": r.get("poster_path"),
                         "popularity": r.get("popularity", 0),
                     })
+            return results
+
+        # movie + tv searches are independent — run them concurrently
+        # instead of one after the other.
+        per_kind_results = await asyncio.gather(*(_search_kind(k) for k in kinds))
+        for results in per_kind_results:
+            candidates.extend(results)
         _breaker.record_success()
     except Exception as e:
         _breaker.record_failure()
@@ -121,8 +130,8 @@ async def get_logo_url(tmdb_id: int, kind: str):
 
     api_kind = "movie" if kind == "movie" else "tv"
     try:
-        async with aiohttp.ClientSession() as session:
-            data = await _get(session, f"/{api_kind}/{tmdb_id}/images", {"include_image_language": "en,ta,null"})
+        session = await get_session()
+        data = await _get(session, f"/{api_kind}/{tmdb_id}/images", {"include_image_language": "en,ta,null"})
         _breaker.record_success()
     except Exception as e:
         _breaker.record_failure()

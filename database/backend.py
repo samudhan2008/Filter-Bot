@@ -21,6 +21,7 @@ import aiohttp
 
 import info
 from utils.netutil import retry_async, CircuitBreaker
+from utils.http import get_session
 
 logger = logging.getLogger(__name__)
 
@@ -30,11 +31,11 @@ _breaker = CircuitBreaker(fail_threshold=4, cooldown=120)
 
 @retry_async(retries=3, base_delay=1.0, exceptions=(aiohttp.ClientError,))
 async def _fetch_raw(url: str):
-    async with aiohttp.ClientSession() as session:
-        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-            if resp.status != 200:
-                raise aiohttp.ClientError(f"HTTP {resp.status}")
-            return await resp.json(content_type=None)
+    session = await get_session()
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        if resp.status != 200:
+            raise aiohttp.ClientError(f"HTTP {resp.status}")
+        return await resp.json(content_type=None)
 
 
 async def _fetch(kind: str):
@@ -74,10 +75,10 @@ async def _fetch(kind: str):
 
 async def force_refresh():
     """Bypasses the cache TTL — used by the /reindex_check reconciliation job."""
+    import asyncio
     _cache["ts"]["movies"] = 0
     _cache["ts"]["series"] = 0
-    movies = await _fetch("movies")
-    series = await _fetch("series")
+    movies, series = await asyncio.gather(_fetch("movies"), _fetch("series"))
     return movies, series
 
 

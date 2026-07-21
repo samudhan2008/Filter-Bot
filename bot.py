@@ -78,7 +78,9 @@ class SCFilesBot(Client):
 
     async def stop(self, *args):
         from utils.clients import stop_workers
+        from utils.http import close_session
         await stop_workers()
+        await close_session()
         await super().stop()
         logger.info("SC Files Bot stopped.")
 
