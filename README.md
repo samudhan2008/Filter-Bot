@@ -360,3 +360,25 @@ Everything from the previous round (season poster fetch, blur-fill compositing, 
 For the "all episodes in this season" case (and as a fallback if a specific episode has no still available), the season poster is now sent **as the actual TMDB poster image, untouched** — no more forcing it onto the 1280×720 landscape canvas with a blurred background fill. Simpler, and just shows the real artwork.
 
 `utils/poster.py` gained `build_full_poster()` for this — a plain fetch-and-cache with no canvas compositing, no gradient, no logo overlay. The blur-fill compositing mode in `build_poster()` still exists in the code (it's a generic capability), it's just not used by this flow anymore. The episode-still path from the previous round is unchanged — a specific episode still gets its own landscape still image composited with the logo, same as a movie result.
+
+---
+
+## v17: poster archive channel — fixes OOM risk on repeats AND cache durability
+
+Great idea from you here — this solves two problems at once:
+
+1. **OOM risk on repeat posters** — the disk cache helped, but only within one running instance; regenerating a poster still costs the same memory every time it's *not* already on that instance's disk.
+2. **Disk cache doesn't survive a redeploy anyway** — most container platforms (including Koyeb) give you an ephemeral filesystem per instance, so the disk cache was quietly rebuilding itself after every restart regardless.
+
+### New env var
+`POSTER_CHANNEL` — a channel ID the bot archives every freshly-generated poster into. Optional; leave unset to keep the old disk-cache-only behavior unchanged. The bot needs to be an admin of this channel (same requirement as any indexed channel).
+
+### How it works
+Three tiers now, checked in order:
+1. **Disk cache** (unchanged from before) — fastest, but instance-local and lost on restart.
+2. **Telegram-channel cache** (new) — `database/postersdb.py` stores `{cache_key: telegram_file_id}` in MongoDB. On a hit, the bot sends that `file_id` straight to the user — **no download, no re-compositing, next to zero memory used**, and it survives restarts/redeploys since it's just a Mongo lookup + a Telegram-side file reference.
+3. **Generate fresh** — same compositing pipeline as before (concurrent fetch, threaded PIL work, explicit buffer cleanup) — only reached the very first time a given poster/season/episode combination is needed. The result gets pushed to `POSTER_CHANNEL` and its `file_id` saved to Mongo before being sent to the user, so every subsequent request for that same poster hits tier 2 instead.
+
+Cache keys are namespaced by kind (`movie_12345`, `series_12345_s2`, `series_12345_s2e5`, `series_12345_s2_full`, etc.) so a movie and an unrelated series can never collide even if they happen to share a TMDB ID (movie and TV IDs are separate spaces on TMDB).
+
+**Nothing else changes for you** — the poster channel just quietly fills up with archived posters over time; there's no reason to look at it unless you're curious.

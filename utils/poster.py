@@ -3,13 +3,16 @@ Builds the landscape poster shown with every search result:
 TMDB backdrop + a dark gradient at the bottom + the title logo overlaid
 (or, if TMDB has no logo for that title, the title drawn as text instead).
 
-Two speed changes vs the first version:
-1. Backdrop + logo are fetched *concurrently* (asyncio.gather) instead of
-   one after the other — halves the network wait on a cache miss.
-2. The actual PIL compositing (resizing, gradient, pasting) is CPU-bound
-   and synchronous; it now runs in a worker thread (asyncio.to_thread)
-   instead of directly in the event loop, so building one poster doesn't
-   stall every other concurrent request the bot is handling.
+Three cache tiers, in order:
+1. On-disk cache (POSTER_CACHE_DIR) — fastest, but local to this instance
+   and lost on restart/redeploy.
+2. Telegram-channel-backed Mongo cache (POSTER_CHANNEL, database/postersdb.py)
+   — once a poster's been generated, its file_id is archived and reused
+   directly (photo=file_id) with no bytes touched at all on a hit. Survives
+   restarts. Optional — off if POSTER_CHANNEL isn't set.
+3. Generate fresh — backdrop + logo fetched concurrently, then composited
+   in a worker thread (asyncio.to_thread) so it doesn't block the event
+   loop for other concurrent requests.
 """
 
 import asyncio
@@ -176,51 +179,88 @@ def _composite_sync(title: str, backdrop_bytes, logo_bytes, backdrop_is_portrait
     return data
 
 
-async def build_full_poster(poster_path: str, tmdb_id=None, kind: str = "series", cache_suffix: str = "") -> bytes:
-    """Returns the raw TMDB poster image as-is — no canvas compositing, no
+async def _resolve_with_channel_cache(bot, cache_key, kind: str, generate_coro):
+    """
+    3-tier lookup: disk cache (fastest, this instance only) -> Telegram-
+    channel-backed Mongo cache (persistent, near-zero cost on hit) ->
+    generate fresh (the only tier that actually costs memory/CPU/network).
+
+    Returns (ref, is_file_id):
+      is_file_id=True  -> ref is a Telegram file_id string; send via
+                          `photo=ref` directly, no bytes touched at all.
+      is_file_id=False -> ref is raw PNG bytes; wrap in BytesIO to send.
+
+    generate_coro: async callable, no args, returning fresh PNG bytes (or
+    None on failure).
+    """
+    if cache_key is not None:
+        cached = _cached(cache_key, kind)
+        if cached is not None:
+            return cached, False
+
+        if info.POSTER_CHANNEL and bot is not None:
+            from database import postersdb
+            mongo_key = f"{kind}_{cache_key}"  # namespaced so a movie and a series can't collide on the same tmdb_id
+            file_id = await postersdb.get_poster_file_id(mongo_key)
+            if file_id:
+                return file_id, True
+
+    data = await generate_coro()
+    if not data:
+        return None, False
+
+    if cache_key is not None:
+        _store_cache(cache_key, kind, data)
+
+        if info.POSTER_CHANNEL and bot is not None:
+            from database import postersdb
+            mongo_key = f"{kind}_{cache_key}"
+            try:
+                buf = io.BytesIO(data)
+                buf.name = "poster.png"
+                msg = await bot.send_photo(info.POSTER_CHANNEL, photo=buf, caption=f"🗄 {mongo_key}")
+                buf.close()
+                if msg and msg.photo:
+                    await postersdb.save_poster_file_id(mongo_key, msg.photo.file_id, kind)
+            except Exception as e:
+                logger.warning(f"Could not archive poster to POSTER_CHANNEL: {e}")
+
+    return data, False
+
+
+async def build_full_poster(bot, poster_path: str, tmdb_id=None, kind: str = "series", cache_suffix: str = ""):
+    """Returns (ref, is_file_id) — see _resolve_with_channel_cache. The raw
+    TMDB poster image as-is when generated fresh: no canvas compositing, no
     blur-fill, no logo overlay. Used when we'd rather show the actual
     poster art directly than force a portrait image onto our landscape
     canvas (e.g. a season with no single episode picked, so there's no
     per-episode still to use instead)."""
     if not poster_path:
-        return None
+        return None, False
     cache_key = f"{tmdb_id}{cache_suffix}_full" if tmdb_id is not None else None
-    if cache_key is not None:
-        cached = _cached(cache_key, kind)
-        if cached is not None:
-            return cached
 
-    data = await _fetch_bytes(tmdb.poster_url(poster_path))
-    if data and cache_key is not None:
-        _store_cache(cache_key, kind, data)
-    return data
+    async def _generate():
+        return await _fetch_bytes(tmdb.poster_url(poster_path))
+
+    return await _resolve_with_channel_cache(bot, cache_key, kind, _generate)
 
 
-async def build_poster(title: str, backdrop_path: str, logo_url: str = None, tmdb_id=None, kind: str = "movie",
-                        backdrop_is_portrait: bool = False, cache_suffix: str = "") -> bytes:
-    """Returns PNG bytes ready to send as a photo. Cached on disk per
-    (kind, tmdb_id[, cache_suffix]) — a repeat search for the same title
-    (and, for series, the same season) skips all of this.
+async def build_poster(bot, title: str, backdrop_path: str, logo_url: str = None, tmdb_id=None, kind: str = "movie",
+                        backdrop_is_portrait: bool = False, cache_suffix: str = ""):
+    """Returns (ref, is_file_id) — see _resolve_with_channel_cache.
 
     backdrop_is_portrait: set True when `backdrop_path` is actually a
-    portrait poster (e.g. a TV season poster — TMDB has no per-season
-    landscape backdrop) rather than a true landscape backdrop, so it gets
-    blur-filled instead of harshly center-cropped.
+    portrait poster rather than a true landscape backdrop, so it gets
+    blur-filled instead of harshly center-cropped when generated fresh.
     """
-    cache_key = f"{tmdb_id}{cache_suffix}" if cache_suffix else tmdb_id
-    if tmdb_id is not None:
-        cached = _cached(cache_key, kind)
-        if cached is not None:
-            return cached
+    cache_key = f"{tmdb_id}{cache_suffix}" if tmdb_id is not None else None
 
-    img_url = tmdb.poster_url(backdrop_path) if backdrop_is_portrait else tmdb.backdrop_url(backdrop_path)
-    backdrop_bytes, logo_bytes = await asyncio.gather(
-        _fetch_bytes(img_url if backdrop_path else None),
-        _fetch_bytes(logo_url),
-    )
+    async def _generate():
+        img_url = tmdb.poster_url(backdrop_path) if backdrop_is_portrait else tmdb.backdrop_url(backdrop_path)
+        backdrop_bytes, logo_bytes = await asyncio.gather(
+            _fetch_bytes(img_url if backdrop_path else None),
+            _fetch_bytes(logo_url),
+        )
+        return await asyncio.to_thread(_composite_sync, title, backdrop_bytes, logo_bytes, backdrop_is_portrait)
 
-    data = await asyncio.to_thread(_composite_sync, title, backdrop_bytes, logo_bytes, backdrop_is_portrait)
-
-    if tmdb_id is not None:
-        _store_cache(cache_key, kind, data)
-    return data
+    return await _resolve_with_channel_cache(bot, cache_key, kind, _generate)

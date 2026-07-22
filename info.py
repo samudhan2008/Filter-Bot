@@ -62,6 +62,15 @@ TMDB_CACHE_TTL = int(environ.get('TMDB_CACHE_TTL', '600'))  # seconds, search + 
 # ---- Poster cache ----
 POSTER_CACHE_DIR = environ.get('POSTER_CACHE_DIR', 'poster_cache')
 POSTER_CACHE_TTL = int(environ.get('POSTER_CACHE_TTL', '86400'))  # 1 day on disk
+# Optional: a channel the bot archives every generated poster into. Once a
+# poster's been generated once, its Telegram file_id is stored in Mongo
+# (see database/postersdb.py) keyed the same way as the disk cache, so a
+# repeat request for the same poster/season/episode just re-sends that
+# file_id — no re-download, no re-compositing, near-zero memory — and it
+# survives restarts/redeploys, unlike the disk cache. Leave unset to keep
+# disk-cache-only behavior.
+poster_channel = environ.get('POSTER_CHANNEL', '')
+POSTER_CHANNEL = int(poster_channel) if poster_channel and id_pattern.search(poster_channel) else None
 
 # ---- Search engine ----
 # Mongo text search scales far better than regex scans once the file

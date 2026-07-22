@@ -445,7 +445,7 @@ async def _show_result(bot: Client, message: Message, candidate: dict, clean_que
     backdrop_path = candidate.get("backdrop_path")
     cache_suffix = ""
     episode_details = None
-    full_poster_bytes = None  # when set, sent as-is — skips canvas/logo compositing entirely
+    poster_ref, poster_is_file_id = None, False  # set below if a full-poster path applies
 
     if episode_task is not None:
         episode_details = await episode_task
@@ -457,21 +457,19 @@ async def _show_result(bot: Client, message: Message, candidate: dict, clean_que
             # the season's actual poster, plainly.
             season_poster_path = await tmdb.get_season_poster(candidate["tmdb_id"], season)
             if season_poster_path:
-                full_poster_bytes = await poster.build_full_poster(
-                    season_poster_path, tmdb_id=candidate["tmdb_id"], kind=kind, cache_suffix=f"_s{season}"
+                poster_ref, poster_is_file_id = await poster.build_full_poster(
+                    bot, season_poster_path, tmdb_id=candidate["tmdb_id"], kind=kind, cache_suffix=f"_s{season}"
                 )
     elif season_poster_task is not None:
         season_poster_path = await season_poster_task
         if season_poster_path:
-            full_poster_bytes = await poster.build_full_poster(
-                season_poster_path, tmdb_id=candidate["tmdb_id"], kind=kind, cache_suffix=f"_s{season}"
+            poster_ref, poster_is_file_id = await poster.build_full_poster(
+                bot, season_poster_path, tmdb_id=candidate["tmdb_id"], kind=kind, cache_suffix=f"_s{season}"
             )
 
-    if full_poster_bytes:
-        poster_bytes = full_poster_bytes
-    else:
-        poster_bytes = await poster.build_poster(
-            title, backdrop_path, logo_url, tmdb_id=candidate["tmdb_id"], kind=kind, cache_suffix=cache_suffix,
+    if poster_ref is None:
+        poster_ref, poster_is_file_id = await poster.build_poster(
+            bot, title, backdrop_path, logo_url, tmdb_id=candidate["tmdb_id"], kind=kind, cache_suffix=cache_suffix,
         )
 
     entry = await entry_task
@@ -511,23 +509,30 @@ async def _show_result(bot: Client, message: Message, candidate: dict, clean_que
     token, ctx = await _new_result_entry(files, effective_query, season, episode, 0, max_results, total, extra_buttons)
     markup = _build_markup(token, files, ctx)
 
-    photo_buf = io.BytesIO(poster_bytes)
-    photo_buf.name = "poster.png"
-    try:
-        await bot.send_photo(
-            chat_id,
-            photo=photo_buf,
-            caption=caption,
-            reply_markup=markup,
-        )
-    finally:
-        # Free the in-memory poster bytes as soon as Telegram has it — no
-        # reason to hold a ~1MB+ buffer alive for the rest of this task's
-        # lifetime. (The on-disk poster cache in utils/poster.py is a
-        # separate, much smaller, deliberately-kept cache for speed on
-        # repeat searches — this only clears the one-off send buffer.)
-        photo_buf.close()
-        del poster_bytes
+    if poster_is_file_id:
+        # Cached in POSTER_CHANNEL — send the existing file_id directly.
+        # No bytes downloaded or held in memory on our end at all.
+        await bot.send_photo(chat_id, photo=poster_ref, caption=caption, reply_markup=markup)
+    else:
+        photo_buf = io.BytesIO(poster_ref) if poster_ref else None
+        if photo_buf:
+            photo_buf.name = "poster.png"
+        try:
+            await bot.send_photo(
+                chat_id,
+                photo=photo_buf,
+                caption=caption,
+                reply_markup=markup,
+            )
+        finally:
+            # Free the in-memory poster bytes as soon as Telegram has it —
+            # no reason to hold a ~1MB+ buffer alive for the rest of this
+            # task's lifetime. (The disk/channel caches in utils/poster.py
+            # are separate, deliberately-kept caches for speed on repeat
+            # searches — this only clears the one-off send buffer.)
+            if photo_buf:
+                photo_buf.close()
+            del poster_ref
 
 
 async def _notify_admin_missing(bot: Client, candidate: dict):
