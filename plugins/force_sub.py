@@ -1,5 +1,6 @@
 import logging
 from pyrogram.errors import UserNotParticipant
+from pyrogram.enums import ChatMemberStatus
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 import info
@@ -12,7 +13,7 @@ async def is_subscribed(bot, user_id: int) -> bool:
         return True
     try:
         member = await bot.get_chat_member(info.AUTH_CHANNEL, user_id)
-        return member.status not in ("left", "kicked")
+        return member.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
     except UserNotParticipant:
         return False
     except Exception as e:

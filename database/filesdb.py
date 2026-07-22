@@ -323,6 +323,23 @@ def _normalize_doc(doc: dict) -> dict:
     return doc
 
 
+async def has_season_data(query: str) -> bool:
+    """Is there at least one file matching this title with a recognized
+    season tag at all? Gates whether the series flow should show a
+    season/episode picker — if a show's files were never tagged with a
+    recognizable S01E01-style marker (a real and common case — plenty of
+    uploads use naming conventions our patterns don't cover, or none at
+    all), forcing a season_number filter downstream would silently exclude
+    every one of them. Better to fall back to a flat, movie-style listing
+    than to show a picker that dead-ends into "no files found" every time.
+    """
+    regex_and = _build_regex_and(query)
+    doc = await Media.collection.find_one(
+        {'normalized_name': regex_and, 'season_number': {'$ne': None}}, {'_id': 1}
+    )
+    return doc is not None
+
+
 async def get_distinct_episodes(query: str, season: int):
     """Which episode numbers actually exist in the DB for this series +
     season, so the bot can show real episode-number buttons instead of

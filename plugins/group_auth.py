@@ -1,7 +1,7 @@
 import logging
 from pyrogram import Client, filters
 from pyrogram.types import Message
-from pyrogram.enums import ChatType
+from pyrogram.enums import ChatType, ChatMemberStatus
 
 import info
 from database import usersdb
@@ -14,7 +14,7 @@ async def _is_group_admin(bot: Client, chat_id: int, user_id: int) -> bool:
         return True
     try:
         member = await bot.get_chat_member(chat_id, user_id)
-        return member.status in ("administrator", "creator")
+        return member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
     except Exception:
         return False
 

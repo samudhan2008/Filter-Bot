@@ -305,10 +305,22 @@ async def _route_to_result(bot: Client, message, candidate: dict, clean_query: s
     specified goes through the season → episode picker first — jumping
     straight to a single poster+file-list for a show with many seasons and
     episodes is exactly the "hard to find a specific episode" problem this
-    is meant to fix."""
+    is meant to fix.
+
+    But that picker is only useful if the indexed files actually carry a
+    recognizable season tag — plenty of real uploads don't (different
+    naming convention, or none at all). Forcing a season filter onto
+    content that was never tagged that way would just show "no files
+    found" for every pick, so this checks the DB first and falls back to
+    a flat, movie-style result if there's nothing season-tagged to browse.
+    """
     chat_id = reply_chat or message.chat.id
     if candidate["kind"] == "series" and season is None:
-        return await _handle_series_flow(bot, chat_id, candidate, clean_query)
+        has_seasons = await filesdb.has_season_data(candidate["title"])
+        if not has_seasons and clean_query != candidate["title"]:
+            has_seasons = await filesdb.has_season_data(clean_query)
+        if has_seasons:
+            return await _handle_series_flow(bot, chat_id, candidate, clean_query)
     return await _show_result(bot, message, candidate, clean_query, season, episode, reply_chat=reply_chat)
 
 
@@ -363,8 +375,17 @@ async def _handle_episode_pick(bot: Client, chat_id: int, candidate: dict, clean
 
     if not episodes:
         # Nothing tagged with a recognizable episode number for this season
-        # — most likely a full-season pack file. Just show everything we
-        # have for the season directly instead of an empty picker.
+        # — most likely a full-season pack file. Before committing to a
+        # season filter, confirm there's actually at least one file tagged
+        # for this season; if not (e.g. TMDB's season numbering doesn't
+        # line up with how this title happens to be tagged in the DB),
+        # fall back to showing everything for the title, unfiltered,
+        # rather than a guaranteed-empty result.
+        _, _, season_total = await filesdb.get_search_results(title, season=season, max_results=1)
+        if season_total == 0 and clean_query != title:
+            _, _, season_total = await filesdb.get_search_results(clean_query, season=season, max_results=1)
+        if season_total == 0:
+            return await _show_result(bot, None, candidate, clean_query, None, None, reply_chat=chat_id)
         return await _show_result(bot, None, candidate, clean_query, season, None, reply_chat=chat_id)
 
     if len(episodes) == 1:

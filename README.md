@@ -382,3 +382,31 @@ Three tiers now, checked in order:
 Cache keys are namespaced by kind (`movie_12345`, `series_12345_s2`, `series_12345_s2e5`, `series_12345_s2_full`, etc.) so a movie and an unrelated series can never collide even if they happen to share a TMDB ID (movie and TV IDs are separate spaces on TMDB).
 
 **Nothing else changes for you** — the poster channel just quietly fills up with archived posters over time; there's no reason to look at it unless you're curious.
+
+---
+
+## v18: series returning nothing — root cause + full logic audit
+
+### The main bug: series search forced a season filter onto untagged content
+Movies never pass a `season`/`episode` filter through the DB search. Series, since the season/episode picker feature was added, always did — once TMDB confirmed a show has seasons, the bot picked (or asked for) a season number and then hard-filtered the DB search to `season_number: <that number>`. If a show's indexed files were never tagged with a recognizable season marker (different naming convention, or none at all — genuinely common), that filter silently excluded every one of them, and every season/episode you picked dead-ended into "no files found." Movies, never being filtered this way, always worked. This is very likely what you were seeing.
+
+**Fix, two layers:**
+1. **`filesdb.has_season_data(query)`** — before entering the season/episode picker at all, the bot now checks whether the DB actually has *any* season-tagged file for that title. If not, it skips the picker entirely and shows a flat, movie-style result instead — same behavior series always should have had when there's no season structure to browse.
+2. **Defensive fallback inside the episode picker** — even when some season data exists, if the *specific* season chosen (via TMDB's list or its own default) turns out to have zero matching files in the DB (numbering mismatch between TMDB and however the files happened to get tagged), it now drops the season filter and shows everything for the title, rather than a guaranteed-empty result.
+
+### Two more real bugs found in the same full pass (not related to the above, but definitely bugs)
+Same root cause as the `chat.type` issue from a few rounds back — comparing a Pyrogram **enum** to a plain string, which is always `False`/always `True` depending on direction, never actually checking anything:
+
+- **`plugins/group_auth.py`** — `member.status in ("administrator", "creator")` never matched, since `member.status` is a `ChatMemberStatus` enum. This meant **real Telegram group admins (who aren't also in the bot's global `ADMINS` list) have never actually been able to run `/auth`/`/unauth` in their own group, or use the "Close" button on results** — only bot-wide admins could. Fixed to compare against `ChatMemberStatus.ADMINISTRATOR` / `.OWNER`.
+- **`plugins/force_sub.py`** — `member.status not in ("left", "kicked")` was always `True` regardless of actual status, silently disabling that check. The primary "are they subscribed" signal (catching the `UserNotParticipant` exception) still worked, but this secondary check — meant to catch a member object explicitly reporting `left`/`banned` instead of raising — did nothing. Fixed to compare against `ChatMemberStatus.LEFT` / `.BANNED`.
+
+### Audit scope
+Went through every plugin and database module end-to-end for this pass: `search.py`, `index.py`, `auto_index.py`, `group_auth.py`, `force_sub.py`, `admin.py`, `start.py`, `bot.py`, `filesdb.py`, `statedb.py`, `backend.py`, `postersdb.py`, and the `utils/` helpers — specifically re-checking pagination offset math, cache-key construction, and every remaining comparison against a Pyrogram-typed attribute for the same enum-vs-string mistake. No other instances of that pattern remained after the two fixes above.
+
+---
+
+## v19: backdrop quality restored
+
+`backdrop_url()` back to `w1280` (from `w780`). That downgrade only made sense when every search regenerated the poster from scratch — now that `POSTER_CHANNEL` means a given poster/season/episode is only ever composited once and reused as a `file_id` after that, the memory tradeoff no longer applies, so there's no reason not to use the sharper source image. This also improves episode stills, since they go through the same `backdrop_url()` path.
+
+Logos stay at `w500` — as covered earlier, TMDB simply doesn't offer anything between `w500` and the much larger `original` for that specific image type, so there's no equivalent "step up" available there.

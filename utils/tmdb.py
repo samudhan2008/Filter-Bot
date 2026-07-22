@@ -152,7 +152,7 @@ async def get_logo_url(tmdb_id: int, kind: str):
     return url
 
 
-def backdrop_url(path: str, size="w780"):
+def backdrop_url(path: str, size="w1280"):
     if not path:
         return None
     return f"{info.TMDB_IMG_BASE}/{size}{path}"
