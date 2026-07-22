@@ -316,3 +316,47 @@ All four moved into MongoDB (`database/statedb.py`), keyed the same way (by toke
 - `index_pending` — `/index`'s "waiting for the channel link" state. TTL: `INDEX_WAIT_TTL` (default 300s).
 
 Each collection has a TTL index on `created_at`, so Mongo expires stale entries on its own — no more manual GC sweep needed in the bot code. If you still see "expired" after this, it's a genuinely stale token (older than its TTL), not a restart wiping things out.
+
+---
+
+## v14: series season/episode browsing + search reliability
+
+### New: season → episode picker for series
+Searching a series with many seasons/episodes used to dump every matching file into one flat list. Now, for any series search where you didn't already pin down a season (e.g. you searched "Breaking Bad" rather than "Breaking Bad S02E05"):
+
+1. **Season picker** — if the show has more than one season, you get `Season 1 / Season 2 / ...` buttons. Skipped automatically if there's only one season.
+2. **Poster switches to that season** — built from TMDB's season poster. Worth knowing: TMDB doesn't provide a per-season *landscape* backdrop, only a portrait poster, so hard-cropping it to our 16:9 canvas would chop off most of the artwork. Instead it's shown blur-filled — a softened, darkened, stretched copy of the poster fills the background, with the actual poster centered on top, uncropped. Falls back to the show's normal backdrop if a season has no poster of its own.
+3. **Episode picker** — built from what's *actually indexed*, not a guessed episode count: it scans the DB for every episode number tagged for that title+season and shows real `E01 / E02 / ...` buttons, plus an "All episodes in this season" option. If nothing in that season has a recognizable episode number (e.g. it's stored as one full-season pack), it skips straight to showing everything for that season.
+4. If you already typed a full `S02E05`-style query, all of this is skipped — same fast path as before, straight to the result.
+
+This reuses (and required broadening) the episode-detection patterns from an earlier round to also catch `Season.1.EP1`, `S01 EP1`, `S01.EP.05`, and similar variants, in both filenames at index time and search queries — see the `_EPISODE_PATTERNS` note below.
+
+### Broader filename convention detection
+`utils/query.py`'s season/episode patterns (used both to parse a search query and to tag every indexed file) now handle flexible separators between the pieces — space, dot, underscore, dash, or nothing — and the `EP`/`Episode`/`E` abbreviations interchangeably. Confirmed matching: `S01E05`, `S01.EP.05`, `S01 EP1`, `S01EP01`, `Season.1.EP1`, `Season 2 Episode 10`, `1x05` — all resolve to the same (season, episode) pair now, however they're punctuated.
+
+**Note:** episode tagging only happens at index time, so files already in the DB before this update keep whatever season/episode tagging they got under the old, narrower patterns. Re-running `/index` on a channel will re-tag everything with the broader rules (duplicates are skipped automatically, so this is safe to re-run).
+
+### "Sometimes not giving results" — added a last-resort search pass
+Root cause (best guess without a specific failing example to test against): the search's word-boundary matching is strict by design — it's what fixed "Blast" wrongly matching "Blasters" a few rounds back — but that same strictness means a query like "spider man" (two words) won't match a file actually named `SpiderMan.2021.mkv` (one word, no space), since neither "spider" nor "man" appears as its own whole word inside "spiderman". Added a third, last-resort pass that only runs when the normal two passes find nothing at all: it strips *all* spaces from both the query and the stored name and checks for a plain substring match. Requires the file to have been indexed (or re-indexed) after this update, since it depends on a new field computed at index time.
+
+If searches are still coming up empty after this, the most useful next step is a specific example (the exact text searched + confirmation the file is actually indexed under a name you'd expect to match) — "sometimes" without a reproducible case is hard to chase further than the two concrete gaps above.
+
+---
+
+## v15: episode-specific art instead of the season poster
+
+Better fix than the blur-fill workaround: TMDB episodes have their own real landscape image (`still_path` — an actual frame/still from the episode), unlike seasons which only have a portrait poster. So now:
+
+- **A specific episode picked** → poster uses that episode's still (true landscape, no cropping tricks needed), and the caption gains the episode's name, air date, and a trimmed overview straight from TMDB.
+- **"All episodes in this season" picked** → no single episode to show a still for, so it falls back to the season poster (still blur-filled, as before) — that case is unchanged.
+- **An episode has no still available** (happens for some unaired/obscure episodes) → falls back to the season poster, then ultimately the show's own backdrop if neither exists.
+
+Everything from the previous round (season poster fetch, blur-fill compositing, per-season disk cache keys) is still there and still used for the season-level case — this just adds a better-fitting option one level down, for when a specific episode is actually selected.
+
+---
+
+## v16: season poster shown as-is, no more blur-fill
+
+For the "all episodes in this season" case (and as a fallback if a specific episode has no still available), the season poster is now sent **as the actual TMDB poster image, untouched** — no more forcing it onto the 1280×720 landscape canvas with a blurred background fill. Simpler, and just shows the real artwork.
+
+`utils/poster.py` gained `build_full_poster()` for this — a plain fetch-and-cache with no canvas compositing, no gradient, no logo overlay. The blur-fill compositing mode in `build_poster()` still exists in the code (it's a generic capability), it's just not used by this flow anymore. The episode-still path from the previous round is unchanged — a specific episode still gets its own landscape still image composited with the logo, same as a movie result.

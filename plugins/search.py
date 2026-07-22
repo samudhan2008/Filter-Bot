@@ -154,7 +154,7 @@ async def on_search_text(bot: Client, message: Message):
         candidates = [c for c in candidates if not c["year"] or str(year) == c["year"]] or candidates
 
     if len(candidates) == 1 or _is_unambiguous(candidates):
-        return await _show_result(bot, message, candidates[0], clean_query, season, episode)
+        return await _route_to_result(bot, message, candidates[0], clean_query, season, episode)
 
     token = _new_token(message.chat.id, message.id)
     await statedb.store_pending(token, {
@@ -203,7 +203,7 @@ async def on_pick_candidate(bot: Client, cq: CallbackQuery):
 
     await cq.answer("Fetching…")
     await cq.message.delete()
-    await _show_result(
+    await _route_to_result(
         bot, cq.message, candidate, pending["query"], pending.get("season"), pending.get("episode"),
         reply_chat=cq.message.chat.id,
     )
@@ -299,6 +299,113 @@ async def on_get_file(bot: Client, cq: CallbackQuery):
         await cq.answer("Sending file…")
 
 
+async def _route_to_result(bot: Client, message, candidate: dict, clean_query: str, season, episode, reply_chat=None):
+    """Movies (and any series where the query already pinned down a season,
+    e.g. "GOT S02E05") go straight to the result. A series with no season
+    specified goes through the season → episode picker first — jumping
+    straight to a single poster+file-list for a show with many seasons and
+    episodes is exactly the "hard to find a specific episode" problem this
+    is meant to fix."""
+    chat_id = reply_chat or message.chat.id
+    if candidate["kind"] == "series" and season is None:
+        return await _handle_series_flow(bot, chat_id, candidate, clean_query)
+    return await _show_result(bot, message, candidate, clean_query, season, episode, reply_chat=reply_chat)
+
+
+async def _handle_series_flow(bot: Client, chat_id: int, candidate: dict, clean_query: str):
+    seasons = await tmdb.get_seasons(candidate["tmdb_id"])
+
+    if len(seasons) > 1:
+        token = uuid.uuid4().hex[:10]
+        await statedb.store_pending(token, {"candidate": candidate, "query": clean_query})
+        rows, row = [], []
+        for s in seasons:
+            row.append(InlineKeyboardButton(f"Season {s['season_number']}", callback_data=f"seas|{token}|{s['season_number']}"))
+            if len(row) == 3:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        return await bot.send_message(
+            chat_id,
+            f"📺 <b>{candidate['title']}</b> has {len(seasons)} seasons — which one?",
+            reply_markup=InlineKeyboardMarkup(rows),
+        )
+
+    # Only one season (or TMDB gave us nothing useful) — no point asking.
+    season = seasons[0]["season_number"] if seasons else 1
+    await _handle_episode_pick(bot, chat_id, candidate, clean_query, season)
+
+
+@Client.on_callback_query(filters.regex(r'^seas\|'))
+async def on_pick_season(bot: Client, cq: CallbackQuery):
+    _, token, season_str = cq.data.split('|', 2)
+    pending = await statedb.get_pending(token)
+    if not pending:
+        return await cq.answer("This search expired, please search again.", show_alert=True)
+    await cq.answer()
+    try:
+        await cq.message.delete()
+    except Exception:
+        pass
+    await _handle_episode_pick(bot, cq.message.chat.id, pending["candidate"], pending["query"], int(season_str))
+
+
+async def _handle_episode_pick(bot: Client, chat_id: int, candidate: dict, clean_query: str, season: int):
+    """Shows real episode-number buttons for this title+season, built from
+    what's actually in the DB (checking S01E01, Season.1.EP1, S01 EP1,
+    1x01, and other conventions — see utils/query.py) rather than guessing
+    an episode count from TMDB."""
+    title = candidate["title"]
+    episodes = await filesdb.get_distinct_episodes(title, season)
+    if not episodes and clean_query != title:
+        episodes = await filesdb.get_distinct_episodes(clean_query, season)
+
+    if not episodes:
+        # Nothing tagged with a recognizable episode number for this season
+        # — most likely a full-season pack file. Just show everything we
+        # have for the season directly instead of an empty picker.
+        return await _show_result(bot, None, candidate, clean_query, season, None, reply_chat=chat_id)
+
+    if len(episodes) == 1:
+        return await _show_result(bot, None, candidate, clean_query, season, episodes[0], reply_chat=chat_id)
+
+    token = uuid.uuid4().hex[:10]
+    await statedb.store_pending(token, {"candidate": candidate, "query": clean_query, "season": season})
+    rows, row = [], []
+    for ep in episodes:
+        row.append(InlineKeyboardButton(f"E{ep:02d}", callback_data=f"epi|{token}|{ep}"))
+        if len(row) == 5:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("📦 All episodes in this season", callback_data=f"epi|{token}|all")])
+    await bot.send_message(
+        chat_id,
+        f"📺 <b>{title}</b> — Season {season}\n{len(episodes)} episode(s) available. Which one?",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+@Client.on_callback_query(filters.regex(r'^epi\|'))
+async def on_pick_episode(bot: Client, cq: CallbackQuery):
+    _, token, ep_str = cq.data.split('|', 2)
+    pending = await statedb.get_pending(token)
+    if not pending:
+        return await cq.answer("This search expired, please search again.", show_alert=True)
+    episode = None if ep_str == "all" else int(ep_str)
+    await cq.answer("Fetching…")
+    try:
+        await cq.message.delete()
+    except Exception:
+        pass
+    await _show_result(
+        bot, None, pending["candidate"], pending["query"], pending["season"], episode,
+        reply_chat=cq.message.chat.id,
+    )
+
+
 async def _show_result(bot: Client, message: Message, candidate: dict, clean_query: str,
                         season=None, episode=None, reply_chat=None):
     chat_id = reply_chat or message.chat.id
@@ -314,16 +421,58 @@ async def _show_result(bot: Client, message: Message, candidate: dict, clean_que
     if not files:
         return await bot.send_message(chat_id, texts.NO_FILES_FOUND.format(query=title))
 
-    # get_logo_url and find_entry are independent — kick both off now so
-    # find_entry's latency overlaps with the (longer) poster build below
-    # instead of adding on top of it.
+    # get_logo_url, find_entry, and (for a series) the episode/season art
+    # are all independent — kick them off together so their latency
+    # overlaps with the (longer) poster build below instead of adding on
+    # top of it.
     logo_task = asyncio.create_task(tmdb.get_logo_url(candidate["tmdb_id"], kind))
     entry_task = asyncio.create_task(backend.find_entry(kind, candidate["tmdb_id"], title))
+    episode_task = None
+    season_poster_task = None
+    if kind == "series" and season is not None:
+        if episode is not None:
+            # A specific episode is picked — episodes have a real
+            # landscape "still" image, so this skips the season poster's
+            # blur-fill workaround entirely.
+            episode_task = asyncio.create_task(tmdb.get_episode_details(candidate["tmdb_id"], season, episode))
+        else:
+            # "All episodes in this season" — no single episode to show a
+            # still for, so we show the season's actual poster plainly.
+            season_poster_task = asyncio.create_task(tmdb.get_season_poster(candidate["tmdb_id"], season))
 
     logo_url = await logo_task
-    poster_bytes = await poster.build_poster(
-        title, candidate.get("backdrop_path"), logo_url, tmdb_id=candidate["tmdb_id"], kind=kind
-    )
+
+    backdrop_path = candidate.get("backdrop_path")
+    cache_suffix = ""
+    episode_details = None
+    full_poster_bytes = None  # when set, sent as-is — skips canvas/logo compositing entirely
+
+    if episode_task is not None:
+        episode_details = await episode_task
+        if episode_details and episode_details.get("still_path"):
+            backdrop_path = episode_details["still_path"]
+            cache_suffix = f"_s{season}e{episode}"
+        else:
+            # No still for this specific episode — fall back to showing
+            # the season's actual poster, plainly.
+            season_poster_path = await tmdb.get_season_poster(candidate["tmdb_id"], season)
+            if season_poster_path:
+                full_poster_bytes = await poster.build_full_poster(
+                    season_poster_path, tmdb_id=candidate["tmdb_id"], kind=kind, cache_suffix=f"_s{season}"
+                )
+    elif season_poster_task is not None:
+        season_poster_path = await season_poster_task
+        if season_poster_path:
+            full_poster_bytes = await poster.build_full_poster(
+                season_poster_path, tmdb_id=candidate["tmdb_id"], kind=kind, cache_suffix=f"_s{season}"
+            )
+
+    if full_poster_bytes:
+        poster_bytes = full_poster_bytes
+    else:
+        poster_bytes = await poster.build_poster(
+            title, backdrop_path, logo_url, tmdb_id=candidate["tmdb_id"], kind=kind, cache_suffix=cache_suffix,
+        )
 
     entry = await entry_task
     website_part = ""
@@ -340,6 +489,16 @@ async def _show_result(bot: Client, message: Message, candidate: dict, clean_que
     ep_note = ""
     if season is not None:
         ep_note = f"\n📺 Season {season}" + (f", Episode {episode}" if episode else "")
+        if episode_details:
+            if episode_details.get("name"):
+                ep_note += f" — {episode_details['name']}"
+            if episode_details.get("air_date"):
+                ep_note += f"\n🗓 Aired: {episode_details['air_date']}"
+            overview = episode_details.get("overview")
+            if overview:
+                if len(overview) > 300:
+                    overview = overview[:297] + "..."
+                ep_note += f"\n\n{overview}"
 
     caption = texts.RESULT_CAPTION.format(
         title=title,

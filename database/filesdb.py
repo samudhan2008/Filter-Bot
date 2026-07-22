@@ -47,6 +47,14 @@ class Media(Document):
     ep_number = fields.IntField(allow_none=True)
     file_date = fields.DateTimeField(allow_none=True)   # when it was originally posted to the source channel
     indexed_at = fields.DateTimeField(allow_none=True)  # when *this bot* saved it — fallback sort key
+    # normalized_name/caption with every space removed too — backs a
+    # last-resort search pass for cases like "spider man" (query, two
+    # words) vs a file actually named "spiderman" (one word, no space).
+    # New field; documents indexed before this update won't have it until
+    # re-indexed, so the fallback pass simply won't reach them yet — every
+    # other search path is unaffected.
+    squeezed_name = fields.StrField(allow_none=True)
+    squeezed_caption = fields.StrField(allow_none=True)
 
     class Meta:
         indexes = ('$normalized_name',)
@@ -109,19 +117,23 @@ def _doc_from_media(media):
     file_id, file_ref = unpack_new_file_id(media.file_id)
     name = str(media.file_name)
     _, season, episode = extract_episode(name)
+    norm_name = normalize(name)
+    caption_html = media.caption.html if media.caption else None
     return {
         '_id': file_id,
         'file_ref': file_ref,
         'file_name': name,
-        'normalized_name': normalize(name),
+        'normalized_name': norm_name,
         'file_size': media.file_size,
         'file_type': media.file_type,
         'mime_type': media.mime_type,
-        'caption': media.caption.html if media.caption else None,
+        'caption': caption_html,
         'season_number': season,
         'ep_number': episode,
         'file_date': getattr(media, 'file_date', None),
         'indexed_at': datetime.now(timezone.utc),
+        'squeezed_name': norm_name.replace(' ', ''),
+        'squeezed_caption': normalize(caption_html).replace(' ', '') if caption_html else None,
     }
 
 
@@ -134,6 +146,7 @@ async def save_file(media):
             file_type=doc['file_type'], mime_type=doc['mime_type'], caption=doc['caption'],
             season_number=doc['season_number'], ep_number=doc['ep_number'],
             file_date=doc['file_date'], indexed_at=doc['indexed_at'],
+            squeezed_name=doc['squeezed_name'], squeezed_caption=doc['squeezed_caption'],
         )
     except ValidationError:
         logger.exception('Error building Media doc')
@@ -276,6 +289,28 @@ async def get_search_results(query, file_type=None, max_results=None, offset=0, 
         cursor2 = coll.find(word_filt).sort(recency_sort).skip(offset2).limit(max_results)
         raw2 = await cursor2.to_list(length=max_results)
 
+    # ---- Pass 3: last resort, only when passes 1+2 found nothing at all ----
+    # Catches spacing/formatting mismatches between the query and the
+    # stored name that word-boundary matching can't — e.g. searching
+    # "spider man" (two words) against a file actually named "spiderman"
+    # (one word, no space): neither pass above matches "spider" or "man"
+    # as a *whole word* inside "spiderman", but squeezing both sides down
+    # to letters-only and checking substring containment does.
+    if total == 0 and offset == 0:
+        squeezed_query = normalize(query).replace(' ', '')
+        if squeezed_query:
+            pattern = re.compile(re.escape(squeezed_query), re.IGNORECASE)
+            squeeze_filt = {**base, 'squeezed_name': pattern}
+            if info.USE_CAPTION_FILTER:
+                squeeze_filt = {**base, '$or': [{'squeezed_name': pattern}, {'squeezed_caption': pattern}]}
+            total3 = await coll.count_documents(squeeze_filt)
+            if total3:
+                cursor3 = coll.find(squeeze_filt).sort(recency_sort).limit(max_results)
+                raw3 = await cursor3.to_list(length=max_results)
+                files = [_normalize_doc(d) for d in raw3]
+                next_offset3 = max_results if max_results < total3 else ''
+                return files, next_offset3, total3
+
     files = [_normalize_doc(d) for d in (raw1 + raw2)]
     return files, next_offset, total
 
@@ -286,6 +321,16 @@ def _normalize_doc(doc: dict) -> dict:
     doc = dict(doc)
     doc['file_id'] = doc.pop('_id', doc.get('file_id'))
     return doc
+
+
+async def get_distinct_episodes(query: str, season: int):
+    """Which episode numbers actually exist in the DB for this series +
+    season, so the bot can show real episode-number buttons instead of
+    guessing. Uses the same AND-regex as the main combined search pass."""
+    regex_and = _build_regex_and(query)
+    filt = {'normalized_name': regex_and, 'season_number': season, 'ep_number': {'$ne': None}}
+    eps = await Media.collection.distinct('ep_number', filt)
+    return sorted(e for e in eps if e is not None)
 
 
 async def get_suggestions(query: str, limit: int = None):

@@ -2,16 +2,24 @@ import re
 
 _YEAR_RE = re.compile(r'\b(19\d{2}|20\d{2})\b')
 
-# Matches S01E02, S1E2, Season 1 Episode 2, 1x02, s01 e02, etc.
+# Flexible separator: matches a space, dot, underscore, dash, or nothing at
+# all between the pieces of a season/episode tag — covers "S01E01",
+# "S01.E01", "S01_E01", "S01 - E01", "S01E01" all the same way.
+_SEP = r'[\s._-]*'
+
+# Broad set of season/episode filename conventions, tried in order:
+#   S01E01, S1E1, S01.E01, S01_EP01, S01 EP 01, S01EP01
+#   Season 1 Episode 1, Season.1.EP1, Season1E1
+#   1x01
 _EPISODE_PATTERNS = [
-    re.compile(r'\bS(\d{1,2})\s*E(\d{1,3})\b', re.IGNORECASE),
-    re.compile(r'\bSeason\s*(\d{1,2})\s*Episode\s*(\d{1,3})\b', re.IGNORECASE),
-    re.compile(r'\b(\d{1,2})x(\d{1,3})\b', re.IGNORECASE),
+    re.compile(rf'\bS(\d{{1,2}}){_SEP}E(?:P)?\.?{_SEP}(\d{{1,3}})\b', re.IGNORECASE),
+    re.compile(rf'\bSeason{_SEP}(\d{{1,2}}){_SEP}(?:Episode|EP|E)\.?{_SEP}(\d{{1,3}})\b', re.IGNORECASE),
+    re.compile(rf'\b(\d{{1,2}})x(\d{{1,3}})\b', re.IGNORECASE),
 ]
-# Matches a bare "S01" / "Season 1" with no episode number — series-wide, one season.
+# A bare "S01" / "Season 1" / "Season.1" with no episode number — series-wide, one season.
 _SEASON_ONLY_PATTERNS = [
     re.compile(r'\bS(\d{1,2})\b', re.IGNORECASE),
-    re.compile(r'\bSeason\s*(\d{1,2})\b', re.IGNORECASE),
+    re.compile(rf'\bSeason{_SEP}(\d{{1,2}})\b', re.IGNORECASE),
 ]
 
 
@@ -28,10 +36,11 @@ def extract_year(text: str):
 
 def extract_episode(text: str):
     """
-    Returns (clean_text, season_or_None, episode_or_None).
-    Tries full S..E.. style patterns first, then falls back to a bare
-    season-only pattern (e.g. "GOT season 2" -> whole season, no episode
-    filter).
+    Returns (clean_text, season_or_None, episode_or_None). Used both for
+    parsing a user's search query ("GOT S01E03") and for tagging indexed
+    filenames, which show up in all sorts of conventions — S01E01,
+    Season.1.EP1, S01 EP1, S1x01, etc. Tries full season+episode patterns
+    first, then falls back to a bare season-only pattern.
     """
     for pat in _EPISODE_PATTERNS:
         m = pat.search(text)

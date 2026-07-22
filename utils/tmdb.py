@@ -156,3 +156,113 @@ def backdrop_url(path: str, size="w780"):
     if not path:
         return None
     return f"{info.TMDB_IMG_BASE}/{size}{path}"
+
+
+def poster_url(path: str, size="w500"):
+    if not path:
+        return None
+    return f"{info.TMDB_IMG_BASE}/{size}{path}"
+
+
+_season_cache = TTLCache(ttl=info.TMDB_CACHE_TTL * 6, max_size=1000)  # season lists don't change often
+
+
+async def get_seasons(tv_id):
+    """Returns [{season_number, name, episode_count}, ...] for a TV show,
+    season 0 ("Specials") excluded unless it's the only season that exists."""
+    if not info.TMDB_API_KEY:
+        return []
+    cache_key = ("seasons", tv_id)
+    cached = _season_cache.get(cache_key)
+    if cached is not None:
+        return cached
+    if not _breaker.allow():
+        return []
+    try:
+        session = await get_session()
+        data = await _get(session, f"/tv/{tv_id}", {})
+        _breaker.record_success()
+    except Exception as e:
+        _breaker.record_failure()
+        logger.warning(f"TMDB get_seasons failed: {e}")
+        return []
+    if not data:
+        return []
+    seasons = [
+        {"season_number": s["season_number"], "name": s.get("name") or f"Season {s['season_number']}",
+         "episode_count": s.get("episode_count", 0)}
+        for s in data.get("seasons", [])
+    ]
+    real = [s for s in seasons if s["season_number"] > 0]
+    result = real if real else seasons
+    result.sort(key=lambda s: s["season_number"])
+    _season_cache.set(cache_key, result)
+    return result
+
+
+async def get_season_poster(tv_id, season_number):
+    """TMDB doesn't provide a per-season *backdrop* (landscape) — only a
+    poster (portrait). Returns that poster's path, or None. Callers that
+    want a landscape image should fall back to the show's overall
+    backdrop_path when this comes back empty, or handle the portrait
+    aspect explicitly (see utils/poster.py's blurred-fill mode)."""
+    if not info.TMDB_API_KEY:
+        return None
+    cache_key = ("season_poster", tv_id, season_number)
+    cached = _season_cache.get(cache_key)
+    if cached is not None:
+        return cached or None
+    if not _breaker.allow():
+        return None
+    try:
+        session = await get_session()
+        data = await _get(session, f"/tv/{tv_id}/season/{season_number}", {})
+        _breaker.record_success()
+    except Exception as e:
+        _breaker.record_failure()
+        logger.warning(f"TMDB get_season_poster failed: {e}")
+        return None
+    path = data.get("poster_path") if data else None
+    _season_cache.set(cache_key, path or "")
+    return path
+
+
+async def get_episode_details(tv_id, season_number, episode_number):
+    """
+    Unlike seasons, individual episodes DO have a proper landscape image
+    (`still_path` — an actual frame/still from the episode, standard 16:9-
+    ish backdrop aspect), so a specific-episode result doesn't need the
+    season poster's blur-fill workaround at all.
+
+    Returns {name, overview, air_date, still_path, runtime, vote_average}
+    or None.
+    """
+    if not info.TMDB_API_KEY:
+        return None
+    cache_key = ("episode", tv_id, season_number, episode_number)
+    cached = _season_cache.get(cache_key)
+    if cached is not None:
+        return cached or None
+    if not _breaker.allow():
+        return None
+    try:
+        session = await get_session()
+        data = await _get(session, f"/tv/{tv_id}/season/{season_number}/episode/{episode_number}", {})
+        _breaker.record_success()
+    except Exception as e:
+        _breaker.record_failure()
+        logger.warning(f"TMDB get_episode_details failed: {e}")
+        return None
+    if not data:
+        _season_cache.set(cache_key, "")
+        return None
+    result = {
+        "name": data.get("name"),
+        "overview": data.get("overview"),
+        "air_date": data.get("air_date"),
+        "still_path": data.get("still_path"),
+        "runtime": data.get("runtime"),
+        "vote_average": data.get("vote_average"),
+    }
+    _season_cache.set(cache_key, result)
+    return result
