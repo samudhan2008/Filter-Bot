@@ -206,6 +206,18 @@ def _build_regex_any(words):
     return re.compile(pattern, re.IGNORECASE)
 
 
+# Common short connector words that provide essentially no search signal
+# on their own — matching a file purely because it happens to also contain
+# "and" (extremely common) produces false positives, not real matches.
+# Only used to filter the word-level fallback pass; the exact/combined
+# match still requires these words verbatim, since that's correct there
+# (a title genuinely containing "and" should still need it in the file name).
+_STOPWORDS = {
+    'and', 'the', 'a', 'an', 'of', 'in', 'on', 'at', 'to', 'for', 'with',
+    'is', 'it', 'as', 'by', 'or', 'from', 'this', 'that',
+}
+
+
 def _base_filter(file_type, season, episode):
     filt = {}
     if file_type:
@@ -219,20 +231,16 @@ def _base_filter(file_type, season, episode):
 
 async def get_search_results(query, file_type=None, max_results=None, offset=0, season=None, episode=None):
     """
-    Two-pass search, combined query given priority over individual words:
+    Two-pass search, with pass 2 only ever used when pass 1 finds nothing:
 
     1. Combined pass — every word in the query must appear (any order).
        e.g. "hi hello" -> matches names containing both "hi" and "hello".
-    2. Word pass — query split on spaces, each word searched on its own and
-       OR'd together, for files the combined pass missed. e.g. a file named
-       just "hello.mkv" still turns up for "hi hello", just ranked after
-       anything that matched both words.
-
-    The two passes are treated as one virtual concatenated, sorted list
-    (pass 1 entirely before pass 2) for pagination purposes, so `offset`
-    works correctly across page boundaries regardless of which pass a given
-    page's results fall in. Within each pass, results are sorted newest
-    first (by original post date, falling back to when the bot indexed it).
+       If this finds anything at all, it's the *only* thing returned.
+    2. Word pass — only runs when pass 1 found zero matches. Splits the
+       query into words (minus common stopwords like "and"/"the") and
+       matches any one of them, so e.g. a file named just "hello.mkv"
+       still turns up for a query "hi hello" that otherwise matches
+       nothing exactly.
     """
     max_results = max_results or info.MAX_RESULTS
     base = _base_filter(file_type, season, episode)
@@ -255,37 +263,39 @@ async def get_search_results(query, file_type=None, max_results=None, offset=0, 
 
     total1 = await coll.count_documents(combined_filt)
 
-    # ---- Pass 2 filter (individual words, excluding anything pass 1 already covers) ----
-    # Note: can't $nor a filter containing $text (Mongo disallows nesting
-    # $text under $nor/$not), so exclusion always uses the regex-AND form,
-    # even in USE_MONGO_TEXT_SEARCH mode — a harmless approximation, it
-    # just prevents an obvious duplicate rather than needing to be exact.
+    # ---- Pass 2 filter (individual words) — ONLY when pass 1 found nothing ----
+    # Originally this ran whenever pass 1 didn't fill a full page, "topping
+    # up" good exact/combined matches with word-level ones. That's exactly
+    # what caused a search for e.g. "Pritam and Pedro" to also return
+    # something like "Cousins and Kalyanams" — both share the word "and",
+    # and pass 2 would pad in that unrelated match purely because pass 1's
+    # results didn't fill the page on their own. If the exact/combined
+    # match exists at all, it should be the *only* thing shown — word-level
+    # fallback is only useful when there's truly nothing else to show.
+    # Common stopwords are also excluded from the fallback's OR-list, since
+    # a word like "and" matches almost any file and provides no real signal
+    # on its own.
     total2 = 0
     word_filt = None
-    if len(words) > 1:
-        regex_and_excl = _build_regex_and(query)
-        regex_any = _build_regex_any(words)
-        word_filt = {**base, 'normalized_name': regex_any, '$nor': [{'normalized_name': regex_and_excl}]}
-        total2 = await coll.count_documents(word_filt)
+    if total1 == 0 and len(words) > 1:
+        significant_words = [w for w in words if w not in _STOPWORDS]
+        if significant_words:
+            regex_any = _build_regex_any(significant_words)
+            word_filt = {**base, 'normalized_name': regex_any}
+            total2 = await coll.count_documents(word_filt)
 
-    total = total1 + total2
+    total = total1 if total1 > 0 else total2
     next_offset = offset + max_results
     if next_offset >= total:
         next_offset = ''
 
-    # ---- Virtual concatenation: pass 1 results [0, total1), then pass 2 [total1, total) ----
+    # ---- Fetch: pass 1 if it has anything at all, else pass 2 ----
     raw1, raw2 = [], []
-    if offset < total1:
-        take1 = min(max_results, total1 - offset)
-        cursor1 = coll.find(combined_filt, pass1_projection).sort(pass1_sort).skip(offset).limit(take1)
-        raw1 = await cursor1.to_list(length=take1)
-        remaining = max_results - len(raw1)
-        if remaining > 0 and word_filt is not None:
-            cursor2 = coll.find(word_filt).sort(recency_sort).skip(0).limit(remaining)
-            raw2 = await cursor2.to_list(length=remaining)
+    if total1 > 0:
+        cursor1 = coll.find(combined_filt, pass1_projection).sort(pass1_sort).skip(offset).limit(max_results)
+        raw1 = await cursor1.to_list(length=max_results)
     elif word_filt is not None:
-        offset2 = offset - total1
-        cursor2 = coll.find(word_filt).sort(recency_sort).skip(offset2).limit(max_results)
+        cursor2 = coll.find(word_filt).sort(recency_sort).skip(offset).limit(max_results)
         raw2 = await cursor2.to_list(length=max_results)
 
     # ---- Pass 3: last resort, only when passes 1+2 found nothing at all ----

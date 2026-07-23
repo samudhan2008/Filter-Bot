@@ -434,3 +434,23 @@ No new toggle needed, as requested — your existing `SHORTLINK_MODE` env var do
 ### Stalling / status messages
 - `utils/texts.py` gained rotating message pools: `wait_message()` ("⏳ Please wait…", "🔄 Processing…", etc.), `fetching_toast()` (used for the quick toast when tapping a disambiguation/season/episode button), and `not_found()` — several friendlier phrasings for "no files found", including a casual "Sry, pls check the spelling and try again" variant, picked at random so repeat misses don't feel like the same canned error every time.
 - The "🔎 Checking TMDB for a match…" status message no longer just gets deleted once TMDB responds — on the direct-to-result path (a single, unambiguous match), it's now *edited* into a rotating "please wait / processing" message and only cleared right before the actual poster+file result is sent, so there's continuous feedback through what's usually the slowest part of a search (TMDB lookup + poster generation) instead of a gap in between. For paths that show a picker next (disambiguation, season/episode) or come up empty, the status message is just cleared as before, since new content follows immediately anyway.
+
+---
+
+## v21: two real bugs from live testing
+
+### Bug 1: episode click → poster archived, but no response to the user
+Root cause: `ctx["extra_buttons"]` (the "🌐 Watch on SC Files" button) was being stored as raw `InlineKeyboardButton` objects inside the result entry saved to Mongo (`statedb.store_results`). Pyrogram objects aren't BSON-serializable, so that call threw every time a website match was found — which happened *after* the poster had already been generated and archived to `POSTER_CHANNEL`, and the exception was never caught, so Pyrogram swallowed it with no visible error and no reply to the user. This is exactly the symptom described: poster shows up in the channel, nothing reaches the person who clicked.
+
+Fixed by storing `extra_buttons` as plain `{"text":..., "url":...}` dicts (BSON-safe) and reconstructing real `InlineKeyboardButton`s only when building the markup for display. Also fixed a related inconsistency while in there: the button was using the *un*-shortened website link while the caption text next to it showed the shortened one — both now use the same (shortened, when `SHORTLINK_MODE` is on) link.
+
+**This means any result where a "Watch on SC Files" button appeared was broken before this fix** — not just series specifically; it likely happened to surface first on a series search purely because that title had a website match and the movie you'd tested earlier didn't.
+
+### Bug 2: "and" causing unrelated false matches (e.g. "Pritam and Pedro" → also "Cousins and Kalyanams")
+Two compounding issues in the search's word-level fallback pass:
+1. It was running (to "top up" a partial page) even when the exact/combined match already had plenty of results — so an unrelated file sharing just one word could get pulled in alongside genuinely correct matches.
+2. It treated every word in the query as equally meaningful, including connector words like "and", which appear in huge numbers of unrelated titles and provide no real signal.
+
+Fixed both: the word-level fallback now **only ever runs when the exact/combined match finds absolutely nothing** — if there's an exact match, that's the *only* thing shown, full stop. And when the fallback does run (a genuine zero-match case), it now excludes a stopword list (`and, the, a, an, of, in, on, at, to, for, with, is, it, as, by, or, from, this, that`) so a query like "X and Y" can't accidentally match on "and" alone.
+
+Verified directly: searching "Pritam and Pedro" now matches `Pritam.and.Pedro.mkv` and correctly rejects `Cousins.and.Kalyanams.mkv`, both under the exact-match pass and (as a backup) under the corrected fallback pass.

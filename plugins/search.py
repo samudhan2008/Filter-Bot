@@ -73,7 +73,8 @@ def _pagination_row(token, offset, max_results, total):
 
 async def _build_markup(bot: Client, token, files, ctx):
     rows = await _file_button_rows(bot, files)
-    rows.extend(ctx.get("extra_buttons", []))
+    for row in ctx.get("extra_buttons", []):
+        rows.append([InlineKeyboardButton(b["text"], url=b["url"]) for b in row])
     rows.extend(_pagination_row(token, ctx["offset"], ctx["max_results"], ctx["total"]))
     rows.append([InlineKeyboardButton("✖️ Close", callback_data="close")])
     return InlineKeyboardMarkup(rows)
@@ -507,7 +508,14 @@ async def _show_result(bot: Client, message: Message, candidate: dict, clean_que
         from utils.shortlink import shorten
         short_link = await shorten(link)
         website_part = texts.WEBSITE_LINE.format(link=short_link)
-        extra_buttons = [[InlineKeyboardButton("🌐 Watch on SC Files", url=link)]]
+        # Plain dicts, not InlineKeyboardButton objects — this gets stored
+        # in Mongo via _new_result_entry below, and Pyrogram objects aren't
+        # BSON-serializable. Storing the raw object here was silently
+        # throwing inside statedb.store_results() whenever a website match
+        # was found, which is why a search could get all the way through
+        # generating (and archiving) the poster and then just... stop, with
+        # no message and no visible error.
+        extra_buttons = [[{"text": "🌐 Watch on SC Files", "url": short_link}]]
     else:
         await _notify_admin_missing(bot, candidate)
 
