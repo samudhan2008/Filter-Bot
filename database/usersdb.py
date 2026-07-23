@@ -1,11 +1,8 @@
 import logging
-from motor.motor_asyncio import AsyncIOMotorClient
 import info
+from database.mongo import db
 
 logger = logging.getLogger(__name__)
-
-client = AsyncIOMotorClient(info.DATABASE_URI)
-db = client[info.DATABASE_NAME]
 
 users_col = db['users']
 groups_col = db['groups']

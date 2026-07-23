@@ -16,14 +16,10 @@ manual GC sweep needed anymore.
 import logging
 from datetime import datetime, timezone
 
-from motor.motor_asyncio import AsyncIOMotorClient
-
 import info
+from database.mongo import db
 
 logger = logging.getLogger(__name__)
-
-client = AsyncIOMotorClient(info.DATABASE_URI)
-db = client[info.DATABASE_NAME]
 
 results_col = db['search_results']   # file-delivery + pagination state
 pending_col = db['search_pending']   # disambiguation candidate picks

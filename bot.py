@@ -58,6 +58,9 @@ class SCFilesBot(Client):
         from database.statedb import ensure_state_indexes
         await ensure_state_indexes()
 
+        from database.verifydb import ensure_verify_indexes
+        await ensure_verify_indexes()
+
         # Optional multi-client worker pool for send/broadcast load spreading.
         from utils.clients import start_workers
         workers = await start_workers()

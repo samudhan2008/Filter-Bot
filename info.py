@@ -92,6 +92,13 @@ SHORTLINK_MODE = is_enabled(environ.get('SHORTLINK_MODE', 'False'), False)
 SHORTLINK_URL = environ.get('SHORTLINK_URL', '')     # e.g. tnshort.net
 SHORTLINK_API = environ.get('SHORTLINK_API', '')
 
+# When SHORTLINK_MODE is on, file delivery goes through a one-time-per-
+# window shortlink verification (anti-bypass — see database/verifydb.py)
+# instead of handing files over directly. No separate toggle: SHORTLINK_MODE
+# alone controls both the link shortening and this verification gate.
+VERIFY_VALID_HOURS = int(environ.get('VERIFY_VALID_HOURS', '24'))   # how long a verification lasts
+VERIFY_TOKEN_TTL = int(environ.get('VERIFY_TOKEN_TTL', '600'))       # seconds to complete the shortlink click
+
 # ---- Misc behaviour ----
 PICS = (environ.get('PICS', 'https://graph.org/file/ce1723991756e48c35aa1.jpg')).split()
 CACHE_TIME = int(environ.get('CACHE_TIME', '1800'))

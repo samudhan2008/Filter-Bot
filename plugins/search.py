@@ -4,7 +4,7 @@ import logging
 import math
 import uuid
 
-from pyrogram import Client, filters, enums
+from pyrogram import Client, filters
 from pyrogram.enums import ChatType
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
@@ -36,14 +36,25 @@ async def _new_result_entry(files, query, season, episode, offset, max_results, 
     return token, ctx
 
 
-def _file_button_rows(token, files):
-    return [
-        [InlineKeyboardButton(
+async def _file_button_rows(bot: Client, files):
+    """One button per file, always a t.me/<bot>?start=file_<id> deep link —
+    which, being a real Telegram deep link, always opens the clicker's own
+    PM regardless of where the button was pressed, and always maps to
+    exactly one file, so there's no ambiguity about which file a tap
+    delivers. Shortened via SHORTLINK_URL/API when SHORTLINK_MODE is on;
+    actual delivery (and, when enabled, the anti-bypass verification gate)
+    happens in plugins/start.py's /start file_<id> handler."""
+    rows = []
+    for f in files:
+        deep_link = f"https://t.me/{bot.username}?start=file_{f['file_id']}"
+        if info.SHORTLINK_MODE:
+            from utils.shortlink import shorten
+            deep_link = await shorten(deep_link)
+        rows.append([InlineKeyboardButton(
             texts.FILE_BUTTON_LABEL.format(name=f['file_name'][:55], size=human_size(f['file_size'])),
-            callback_data=f"getfile|{token}|{i}",
-        )]
-        for i, f in enumerate(files)
-    ]
+            url=deep_link,
+        )])
+    return rows
 
 
 def _pagination_row(token, offset, max_results, total):
@@ -60,8 +71,8 @@ def _pagination_row(token, offset, max_results, total):
     return [row]
 
 
-def _build_markup(token, files, ctx):
-    rows = _file_button_rows(token, files)
+async def _build_markup(bot: Client, token, files, ctx):
+    rows = await _file_button_rows(bot, files)
     rows.extend(ctx.get("extra_buttons", []))
     rows.extend(_pagination_row(token, ctx["offset"], ctx["max_results"], ctx["total"]))
     rows.append([InlineKeyboardButton("✖️ Close", callback_data="close")])
@@ -120,16 +131,18 @@ async def on_search_text(bot: Client, message: Message):
     text_no_ep, season, episode = queryutil.extract_episode(raw_query)
     clean_query, year = queryutil.extract_year(text_no_ep)
 
-    files, _, total = await filesdb.get_search_results(clean_query, max_results=1, season=season, episode=episode)
+    files, _, total = await filesdb.get_search_results(
+        clean_query, max_results=info.MAX_RESULTS, offset=0, season=season, episode=episode
+    )
     if total == 0:
         suggestions = await filesdb.get_suggestions(clean_query)
         if suggestions:
             sugg_lines = "\n".join(f"• {s}" for s in suggestions)
             await message.reply(
-                texts.NO_FILES_FOUND.format(query=raw_query) + f"\n\n🤔 Did you mean:\n{sugg_lines}"
+                texts.not_found(raw_query) + f"\n\n🤔 Did you mean:\n{sugg_lines}"
             )
         else:
-            await message.reply(texts.NO_FILES_FOUND.format(query=raw_query))
+            await message.reply(texts.not_found(raw_query))
         return
 
     cancel_token = uuid.uuid4().hex[:10]
@@ -142,19 +155,29 @@ async def on_search_text(bot: Client, message: Message):
 
     if await statedb.pop_cancelled(cancel_token):
         return  # user cancelled — on_cancel_search already updated the status message
-    try:
-        await status_msg.delete()
-    except Exception:
-        pass
 
     if not candidates:
-        return await _send_plain_results(bot, message, clean_query, season, episode)
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+        # Already have these files from the check above — no need to
+        # search again for the same query/season/episode.
+        return await _send_plain_results(bot, message, clean_query, season, episode, prefetched=(files, total))
 
     if year is not None:
         candidates = [c for c in candidates if not c["year"] or str(year) == c["year"]] or candidates
 
     if len(candidates) == 1 or _is_unambiguous(candidates):
-        return await _route_to_result(bot, message, candidates[0], clean_query, season, episode)
+        # status_msg is handed off here — _route_to_result either deletes it
+        # (about to show a picker) or turns it into a "please wait" message
+        # and clears it right before the actual result goes out.
+        return await _route_to_result(bot, message, candidates[0], clean_query, season, episode, status_msg=status_msg)
+
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
 
     token = _new_token(message.chat.id, message.id)
     await statedb.store_pending(token, {
@@ -201,7 +224,7 @@ async def on_pick_candidate(bot: Client, cq: CallbackQuery):
     except (IndexError, ValueError):
         return await cq.answer("Invalid selection.", show_alert=True)
 
-    await cq.answer("Fetching…")
+    await cq.answer(texts.fetching_toast())
     await cq.message.delete()
     await _route_to_result(
         bot, cq.message, candidate, pending["query"], pending.get("season"), pending.get("episode"),
@@ -209,16 +232,19 @@ async def on_pick_candidate(bot: Client, cq: CallbackQuery):
     )
 
 
-async def _send_plain_results(bot: Client, message: Message, clean_query: str, season=None, episode=None):
+async def _send_plain_results(bot: Client, message: Message, clean_query: str, season=None, episode=None, prefetched=None):
     max_results = info.MAX_RESULTS
-    files, _, total = await filesdb.get_search_results(
-        clean_query, max_results=max_results, offset=0, season=season, episode=episode
-    )
+    if prefetched is not None:
+        files, total = prefetched
+    else:
+        files, _, total = await filesdb.get_search_results(
+            clean_query, max_results=max_results, offset=0, season=season, episode=episode
+        )
     if not files:
-        return await message.reply(texts.NO_FILES_FOUND.format(query=clean_query))
+        return await message.reply(texts.not_found(clean_query))
 
     token, ctx = await _new_result_entry(files, clean_query, season, episode, 0, max_results, total)
-    markup = _build_markup(token, files, ctx)
+    markup = await _build_markup(bot, token, files, ctx)
     await message.reply(
         f"📦 Found <b>{total}</b> file(s) for <b>{clean_query}</b>:",
         reply_markup=markup,
@@ -244,7 +270,7 @@ async def on_paginate(bot: Client, cq: CallbackQuery):
     await statedb.update_results(token, files, ctx)
 
     try:
-        await cq.message.edit_reply_markup(reply_markup=_build_markup(token, files, ctx))
+        await cq.message.edit_reply_markup(reply_markup=await _build_markup(bot, token, files, ctx))
     except Exception as e:
         logger.warning(f"Pagination edit failed: {e}")
     await cq.answer()
@@ -255,51 +281,8 @@ async def on_noop(bot: Client, cq: CallbackQuery):
     await cq.answer()
 
 
-@Client.on_callback_query(filters.regex(r'^getfile\|'))
-async def on_get_file(bot: Client, cq: CallbackQuery):
-    _, token, idx = cq.data.split('|', 2)
-    entry = await statedb.get_results(token)
-    if not entry:
-        return await cq.answer("This result has expired — please search again.", show_alert=True)
-    try:
-        f = entry["files"][int(idx)]
-    except (IndexError, ValueError):
-        return await cq.answer("File not found.", show_alert=True)
-
-    caption = f.get('caption')
-    if caption and len(caption) > 1024:  # Telegram's caption length cap
-        caption = caption[:1021] + "..."
-
-    # Always deliver to the clicking user's own PM, never into the group the
-    # search happened in — regardless of where the button was pressed.
-    try:
-        await bot.send_cached_media(
-            chat_id=cq.from_user.id,
-            file_id=f['file_id'],
-            caption=caption,
-            parse_mode=enums.ParseMode.HTML,
-            protect_content=info.PROTECT_CONTENT,
-        )
-    except Exception as e:
-        logger.warning(f"Could not PM file to {cq.from_user.id}: {e}")
-        if cq.message.chat.type != ChatType.PRIVATE:
-            return await cq.answer(
-                "⚠️ I couldn't message you privately — please start me in PM first "
-                "(tap my name, hit Start), then tap this button again.",
-                show_alert=True,
-            )
-        return await cq.answer(
-            "❌ Couldn't send that file — it may have expired. Please search again.",
-            show_alert=True,
-        )
-
-    if cq.message.chat.type != ChatType.PRIVATE:
-        await cq.answer("✅ Sent to your PM — check your DMs!", show_alert=False)
-    else:
-        await cq.answer("Sending file…")
-
-
-async def _route_to_result(bot: Client, message, candidate: dict, clean_query: str, season, episode, reply_chat=None):
+async def _route_to_result(bot: Client, message, candidate: dict, clean_query: str, season, episode,
+                            reply_chat=None, status_msg=None):
     """Movies (and any series where the query already pinned down a season,
     e.g. "GOT S02E05") go straight to the result. A series with no season
     specified goes through the season → episode picker first — jumping
@@ -313,6 +296,12 @@ async def _route_to_result(bot: Client, message, candidate: dict, clean_query: s
     content that was never tagged that way would just show "no files
     found" for every pick, so this checks the DB first and falls back to
     a flat, movie-style result if there's nothing season-tagged to browse.
+
+    status_msg: the "checking TMDB" message from on_search_text, if any —
+    deleted here if we're about to show a picker (new interactive content
+    follows immediately, no need for a wait message), or handed to
+    _show_result to turn into a "please wait" message and clear right
+    before the actual result is sent, if we're going straight there.
     """
     chat_id = reply_chat or message.chat.id
     if candidate["kind"] == "series" and season is None:
@@ -320,8 +309,20 @@ async def _route_to_result(bot: Client, message, candidate: dict, clean_query: s
         if not has_seasons and clean_query != candidate["title"]:
             has_seasons = await filesdb.has_season_data(clean_query)
         if has_seasons:
+            if status_msg:
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
             return await _handle_series_flow(bot, chat_id, candidate, clean_query)
-    return await _show_result(bot, message, candidate, clean_query, season, episode, reply_chat=reply_chat)
+
+    if status_msg:
+        try:
+            await status_msg.edit_text(texts.wait_message())
+        except Exception:
+            pass
+    return await _show_result(bot, message, candidate, clean_query, season, episode,
+                               reply_chat=reply_chat, status_msg=status_msg)
 
 
 async def _handle_series_flow(bot: Client, chat_id: int, candidate: dict, clean_query: str):
@@ -416,7 +417,7 @@ async def on_pick_episode(bot: Client, cq: CallbackQuery):
     if not pending:
         return await cq.answer("This search expired, please search again.", show_alert=True)
     episode = None if ep_str == "all" else int(ep_str)
-    await cq.answer("Fetching…")
+    await cq.answer(texts.fetching_toast())
     try:
         await cq.message.delete()
     except Exception:
@@ -428,7 +429,7 @@ async def on_pick_episode(bot: Client, cq: CallbackQuery):
 
 
 async def _show_result(bot: Client, message: Message, candidate: dict, clean_query: str,
-                        season=None, episode=None, reply_chat=None):
+                        season=None, episode=None, reply_chat=None, status_msg=None):
     chat_id = reply_chat or message.chat.id
     kind = candidate["kind"]  # 'movie' or 'series'
     title = candidate["title"]
@@ -440,7 +441,12 @@ async def _show_result(bot: Client, message: Message, candidate: dict, clean_que
         effective_query = clean_query
         files, _, total = await filesdb.get_search_results(clean_query, max_results=max_results, offset=0, season=season, episode=episode)
     if not files:
-        return await bot.send_message(chat_id, texts.NO_FILES_FOUND.format(query=title))
+        if status_msg:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+        return await bot.send_message(chat_id, texts.not_found(title))
 
     # get_logo_url, find_entry, and (for a series) the episode/season art
     # are all independent — kick them off together so their latency
@@ -528,7 +534,13 @@ async def _show_result(bot: Client, message: Message, candidate: dict, clean_que
     ) + ep_note
 
     token, ctx = await _new_result_entry(files, effective_query, season, episode, 0, max_results, total, extra_buttons)
-    markup = _build_markup(token, files, ctx)
+    markup = await _build_markup(bot, token, files, ctx)
+
+    if status_msg:
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
 
     if poster_is_file_id:
         # Cached in POSTER_CHANNEL — send the existing file_id directly.

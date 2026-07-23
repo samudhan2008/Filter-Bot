@@ -410,3 +410,27 @@ Went through every plugin and database module end-to-end for this pass: `search.
 `backdrop_url()` back to `w1280` (from `w780`). That downgrade only made sense when every search regenerated the poster from scratch — now that `POSTER_CHANNEL` means a given poster/season/episode is only ever composited once and reused as a `file_id` after that, the memory tradeoff no longer applies, so there's no reason not to use the sharper source image. This also improves episode stills, since they go through the same `backdrop_url()` path.
 
 Logos stay at `w500` — as covered earlier, TMDB simply doesn't offer anything between `w500` and the much larger `original` for that specific image type, so there's no equivalent "step up" available there.
+
+---
+
+## v20: deep-link mode restored + anti-bypass shortlink, shared Mongo client, speed, stalling messages
+
+### Deep-link file delivery is back
+File buttons are plain `t.me/<bot>?start=file_<id>` deep links again (removed the callback-based delivery from a couple rounds back). No new env var for this — it's just how file delivery works now. This is actually strictly safe against the two bugs that callback delivery was originally built to fix:
+- **One file per link, no ambiguity** — a deep link always maps to exactly one `file_id`, so there's no "wrong file sent" risk.
+- **Always opens PM** — `t.me/bot?start=...` links are handled by Telegram itself and always open a private chat with the bot, never post into whatever group the button was tapped in.
+
+### Anti-bypass shortlink verification — controlled entirely by `SHORTLINK_MODE`
+No new toggle needed, as requested — your existing `SHORTLINK_MODE` env var does double duty:
+- **`SHORTLINK_MODE=False` (default)** — file deep links work directly, no shortening, no verification. Exactly like a plain deep-link bot.
+- **`SHORTLINK_MODE=True`** — file deep links get shortened, *and* `deliver_file` (in `plugins/start.py`) refuses to hand over any file unless the requesting user currently has a valid verification. This is the actual anti-bypass mechanism, and it's worth understanding honestly: a raw, unshortened deep link can always be copied and shared — there's no way for a plain URL button to check anything before Telegram opens it. So instead of trying to protect the *link*, the bot protects the *file*: it checks verification status server-side at delivery time, regardless of how someone arrived at that link. Verification itself (`database/verifydb.py`) is a single-use, per-user token — created fresh each time it's needed, bound to that specific Telegram user_id, and only obtainable by completing one shortlink round trip. Once verified, that user can grab files freely for `VERIFY_VALID_HOURS` (default 24) before needing to verify again. Sharing a "verified" status doesn't work either, since it's tied to a real Telegram user_id, not something transferable.
+- New env vars (only relevant when `SHORTLINK_MODE=True`): `VERIFY_VALID_HOURS` (default `24`), `VERIFY_TOKEN_TTL` (default `600` seconds to complete the shortlink click before the token expires).
+
+### Speed
+- **Consolidated to a single shared MongoDB client** (`database/mongo.py`) — `filesdb`, `usersdb`, `statedb`, `postersdb`, and the new `verifydb` were each opening their *own* `AsyncIOMotorClient` (separate connection pool, separate heartbeat threads) to the same database. Real, if invisible, overhead; now there's exactly one.
+- **Removed a redundant DB round-trip per search** — `on_search_text` used to run a `max_results=1` pre-check, then (on the "no TMDB match" path) run the *same* query again at full result count. Now it fetches at full count once and reuses that data.
+- **`has_season_data` is now cached** (5 min TTL) — it's checked on every series search since a couple rounds ago, so repeated searches for the same show don't re-run the same DB check.
+
+### Stalling / status messages
+- `utils/texts.py` gained rotating message pools: `wait_message()` ("⏳ Please wait…", "🔄 Processing…", etc.), `fetching_toast()` (used for the quick toast when tapping a disambiguation/season/episode button), and `not_found()` — several friendlier phrasings for "no files found", including a casual "Sry, pls check the spelling and try again" variant, picked at random so repeat misses don't feel like the same canned error every time.
+- The "🔎 Checking TMDB for a match…" status message no longer just gets deleted once TMDB responds — on the direct-to-result path (a single, unambiguous match), it's now *edited* into a rotating "please wait / processing" message and only cleared right before the actual poster+file result is sent, so there's continuous feedback through what's usually the slowest part of a search (TMDB lookup + poster generation) instead of a gap in between. For paths that show a picker next (disambiguation, season/episode) or come up empty, the status message is just cleared as before, since new content follows immediately anyway.

@@ -10,14 +10,11 @@ unlike the disk cache this survives a restart or redeploy.
 import logging
 from datetime import datetime, timezone
 
-from motor.motor_asyncio import AsyncIOMotorClient
-
 import info
+from database.mongo import db
 
 logger = logging.getLogger(__name__)
 
-client = AsyncIOMotorClient(info.DATABASE_URI)
-db = client[info.DATABASE_NAME]
 posters_col = db['poster_cache']
 
 

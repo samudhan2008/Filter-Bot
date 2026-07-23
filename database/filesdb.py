@@ -20,16 +20,15 @@ from pyrogram.file_id import FileId
 from pymongo.errors import DuplicateKeyError, BulkWriteError
 from pymongo import InsertOne, TEXT, DESCENDING
 from umongo import Instance, Document, fields
-from motor.motor_asyncio import AsyncIOMotorClient
 from marshmallow.exceptions import ValidationError
 
 import info
 from utils.query import extract_episode
+from utils.cache import TTLCache
+from database.mongo import db, client
 
 logger = logging.getLogger(__name__)
 
-client = AsyncIOMotorClient(info.DATABASE_URI)
-db = client[info.DATABASE_NAME]
 instance = Instance.from_db(db)
 
 
@@ -323,6 +322,9 @@ def _normalize_doc(doc: dict) -> dict:
     return doc
 
 
+_season_data_cache = TTLCache(ttl=300, max_size=2000)  # 5 min — cheap query, but called on every series search
+
+
 async def has_season_data(query: str) -> bool:
     """Is there at least one file matching this title with a recognized
     season tag at all? Gates whether the series flow should show a
@@ -333,11 +335,18 @@ async def has_season_data(query: str) -> bool:
     every one of them. Better to fall back to a flat, movie-style listing
     than to show a picker that dead-ends into "no files found" every time.
     """
+    cache_key = normalize(query)
+    cached = _season_data_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     regex_and = _build_regex_and(query)
     doc = await Media.collection.find_one(
         {'normalized_name': regex_and, 'season_number': {'$ne': None}}, {'_id': 1}
     )
-    return doc is not None
+    result = doc is not None
+    _season_data_cache.set(cache_key, result)
+    return result
 
 
 async def get_distinct_episodes(query: str, season: int):
