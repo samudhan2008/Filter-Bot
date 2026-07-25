@@ -1,4 +1,5 @@
 import logging
+from urllib.parse import quote
 
 from pyrogram import Client, filters, enums
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
@@ -28,8 +29,15 @@ async def start_cmd(bot: Client, message: Message):
     args = message.text.split(maxsplit=1)
     if len(args) > 1 and args[1].startswith('file_'):
         return await deliver_file(bot, message, args[1].split('file_', 1)[1])
-    if len(args) > 1 and args[1].startswith('verify_'):
-        return await handle_verify(bot, message, args[1].split('verify_', 1)[1])
+    if len(args) > 1 and args[1] == 'verified':
+        # Verification itself already happened server-side (the frontend's
+        # /finish page called our API directly) — this is just the user
+        # landing back in Telegram afterward, so there's nothing left to
+        # redeem here, just acknowledge it.
+        return await message.reply(
+            f"✅ <b>You're verified!</b> Go ahead and tap the file button again — "
+            f"you're good for the next {info.VERIFY_VALID_HOURS} hours."
+        )
 
     await message.reply(
         f"👋 Hi {user.mention}, I'm <b>SC Files Bot</b>!\n\n"
@@ -43,38 +51,24 @@ async def start_cmd(bot: Client, message: Message):
     )
 
 
-async def handle_verify(bot: Client, message: Message, token: str):
-    ok = await verifydb.redeem_verify_token(token, message.from_user.id)
-    if ok:
-        await message.reply(
-            f"✅ <b>Verified!</b> You can download files freely for the next {info.VERIFY_VALID_HOURS} hours "
-            "— just tap any file button from a search result."
-        )
-    else:
-        await message.reply(
-            "❌ This verification link is invalid, expired, or already used.\n\n"
-            "Go back to a search result and tap the file button again to get a fresh one."
-        )
-
-
 async def deliver_file(bot: Client, message: Message, file_id: str):
-    # Anti-bypass gate: only active when SHORTLINK_MODE is on. Sharing a
-    # raw file_id deep link (skipping the shortener) doesn't help here —
-    # the bot still refuses to hand over the file unless *this* user has a
-    # currently-valid verification, which can only be obtained by
-    # completing one shortlink round trip themselves.
-    if info.SHORTLINK_MODE and not await verifydb.is_verified(message.from_user.id):
-        verify_token = await verifydb.create_verify_token(message.from_user.id)
-        raw_link = f"https://t.me/{bot.username}?start=verify_{verify_token}"
-        from utils.shortlink import shorten
-        short_link = await shorten(raw_link)
-        return await message.reply(
-            "🔒 <b>One-time verification needed</b>\n\n"
-            f"Tap below to verify — it's valid for {info.VERIFY_VALID_HOURS} hours, so you'll only need to "
-            "do this occasionally, not on every file.\n\n"
-            "Once verified, come back and tap the file button again.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Verify Now", url=short_link)]]),
-        )
+    # Anti-bypass gate: only active when SHORTLINK_MODE is on, and only if
+    # the frontend that runs the cookie-continuity check is actually
+    # configured. Sharing a raw file_id deep link (or even the raw
+    # shortlink destination) doesn't help bypass this — the bot refuses to
+    # hand over the file unless *this* user currently has a verification
+    # that was obtained by genuinely completing the shortlink round trip,
+    # proven via a cookie set at the start of that flow and checked again
+    # at the end (see database/verifydb.py).
+    if info.SHORTLINK_MODE:
+        if info.FRONTEND_URL and info.FRONTEND_API_SECRET:
+            if not await verifydb.is_verified(message.from_user.id):
+                return await _send_verify_prompt(bot, message)
+        else:
+            logger.warning(
+                "SHORTLINK_MODE is on but FRONTEND_URL/FRONTEND_API_SECRET aren't configured — "
+                "skipping the verification gate (file links are still shortened, just not gated)."
+            )
 
     doc = await filesdb.get_file_by_id(file_id)
     if not doc:
@@ -93,6 +87,25 @@ async def deliver_file(bot: Client, message: Message, file_id: str):
     except Exception as e:
         logger.warning(f"send_cached_media failed: {e}")
         await message.reply("❌ Couldn't send that file. It may have expired — please search again.")
+
+
+async def _send_verify_prompt(bot: Client, message: Message):
+    from utils.shortlink import shorten
+
+    session_id = await verifydb.create_session(message.from_user.id)
+    finish_url = f"{info.FRONTEND_URL}/finish/{session_id}"
+    short_finish_url = await shorten(finish_url)
+    go_url = f"{info.FRONTEND_URL}/go/{session_id}?next={quote(short_finish_url, safe='')}"
+
+    await message.reply(
+        "🔒 <b>One-time verification needed</b>\n\n"
+        f"Tap below to verify — it's valid for {info.VERIFY_VALID_HOURS} hours, so you'll only need to "
+        "do this occasionally, not on every file.\n\n"
+        "⚠️ Please complete it normally (don't skip ahead using a saved link) — bypass attempts are "
+        "detected and flagged.\n\n"
+        "Once verified, come back and tap the file button again.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Verify Now", url=go_url)]]),
+    )
 
 
 @Client.on_message(filters.new_chat_members)

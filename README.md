@@ -454,3 +454,35 @@ Two compounding issues in the search's word-level fallback pass:
 Fixed both: the word-level fallback now **only ever runs when the exact/combined match finds absolutely nothing** — if there's an exact match, that's the *only* thing shown, full stop. And when the fallback does run (a genuine zero-match case), it now excludes a stopword list (`and, the, a, an, of, in, on, at, to, for, with, is, it, as, by, or, from, this, that`) so a query like "X and Y" can't accidentally match on "and" alone.
 
 Verified directly: searching "Pritam and Pedro" now matches `Pritam.and.Pedro.mkv` and correctly rejects `Cousins.and.Kalyanams.mkv`, both under the exact-match pass and (as a backup) under the corrected fallback pass.
+
+---
+
+## v22: cookie-continuity anti-bypass + admin dashboard
+
+A big upgrade to the shortlink verification system from last round, plus a new companion project: a separate Vercel frontend (`scfiles_verify_frontend/`, its own zip/repo — not part of this bot's codebase or Docker image) that does two things: runs a proper cookie-continuity check for shortlink verification, and hosts a password-protected admin dashboard.
+
+### Anti-bypass, upgraded: cookie continuity instead of just "verified recently"
+The previous round's verification only checked "does this user currently have a valid verified-until timestamp" — real, but it couldn't tell whether *this specific attempt* actually walked through the shortlink, only whether they'd done so at some point in the last N hours. The new flow proves continuity across the shortlink hop itself:
+
+1. `deliver_file` creates a session and sends a **"✅ Verify Now"** button pointing at the frontend's `/go/<session>` page (not the shortlink directly).
+2. `/go` sets a random, `HttpOnly` cookie in the browser, registers it with the bot, then redirects to the actual (pre-shortened) shortlink.
+3. After the shortlink's ads/countdown, the user lands on `/finish/<session>` — the shortlink's real destination.
+4. `/finish` reads the cookie back and sends it to the bot for comparison. Match → verified, redirected back into Telegram. Mismatch (missing/wrong cookie — someone jumped straight to `/finish`, skipping the actual shortlink) → flagged as a bypass attempt, on both the web page and as a Telegram warning message to that user.
+5. One-time use — the session record is deleted the instant it's checked, success or failure either way.
+
+Same honest caveat as always: this stops casual bypass (copy-pasting the final link, reusing an old one) but not a fully scripted/automated browser session replaying a captured cookie — no cookie/token scheme fully prevents that.
+
+**Bot-side additions:**
+- `database/verifydb.py` rewritten around sessions instead of simple tokens.
+- `utils/frontend_api.py` — new HTTP API (`/api/verify/set-cookie`, `/api/verify/confirm`) the frontend calls, secured by `FRONTEND_API_SECRET`.
+- `plugins/start.py`'s `deliver_file` now builds the `/go` link (with a pre-shortened `/finish` link baked in) instead of a bare shortened deep link.
+
+**New env vars:** `FRONTEND_URL`, `FRONTEND_API_SECRET`, `VERIFY_SESSION_TTL` (default 900s to complete the whole round trip). `VERIFY_VALID_HOURS` (default 24) carries over from before. If `FRONTEND_URL`/`FRONTEND_API_SECRET` aren't set, `SHORTLINK_MODE` still shortens links but skips verification entirely (fails open, logged) rather than breaking file delivery.
+
+### New: `/admin` dashboard on the frontend
+A password-protected page for bot management without opening Telegram — stats, broadcast, ban/unban, group authorization, triggering `/index` on a channel, the website gap check, and a log viewer. Full details in the frontend project's own README. Deliberately secured with its **own** secret (`ADMIN_API_SECRET`), separate from the verify flow's `FRONTEND_API_SECRET` — the admin API can ban users and broadcast to everyone, meaningfully higher stakes than a cookie check, so a leak of one credential doesn't hand over the other.
+
+**New bot-side file:** `utils/admin_api.py`, registered alongside the verify API in `bot.py`.
+
+### The frontend project
+Delivered separately (`scfiles_verify_frontend/`) since it deploys to Vercel, not this bot's Docker image. Built and verified with a real `next build` (not just a syntax check) — all 9 routes compile cleanly, including the JSX-heavy admin dashboard. Also bumped to Next.js `14.2.35` (the latest patched 14.x release; the version initially scaffolded, 14.2.5, had a known security advisory). Full setup/deployment instructions are in that project's own `README.md`.

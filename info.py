@@ -92,12 +92,27 @@ SHORTLINK_MODE = is_enabled(environ.get('SHORTLINK_MODE', 'False'), False)
 SHORTLINK_URL = environ.get('SHORTLINK_URL', '')     # e.g. tnshort.net
 SHORTLINK_API = environ.get('SHORTLINK_API', '')
 
-# When SHORTLINK_MODE is on, file delivery goes through a one-time-per-
-# window shortlink verification (anti-bypass — see database/verifydb.py)
-# instead of handing files over directly. No separate toggle: SHORTLINK_MODE
-# alone controls both the link shortening and this verification gate.
-VERIFY_VALID_HOURS = int(environ.get('VERIFY_VALID_HOURS', '24'))   # how long a verification lasts
-VERIFY_TOKEN_TTL = int(environ.get('VERIFY_TOKEN_TTL', '600'))       # seconds to complete the shortlink click
+# When SHORTLINK_MODE is on, file delivery goes through a cookie-verified
+# shortlink round trip (anti-bypass — see database/verifydb.py and
+# utils/frontend_api.py) instead of handing files over directly. No
+# separate toggle: SHORTLINK_MODE alone controls both the link shortening
+# and this verification gate.
+VERIFY_VALID_HOURS = int(environ.get('VERIFY_VALID_HOURS', '24'))     # how long a verification lasts
+VERIFY_SESSION_TTL = int(environ.get('VERIFY_SESSION_TTL', '900'))     # seconds to complete the whole shortlink round trip
+
+# The Vercel frontend that runs the cookie-continuity check (see the
+# separate frontend/ project). Both must be set for the verification flow
+# to run — if either is missing, SHORTLINK_MODE still shortens the file
+# link but skips the verification gate (fails open, with a warning logged,
+# rather than silently blocking every file).
+FRONTEND_URL = environ.get('FRONTEND_URL', '').rstrip('/')     # e.g. https://scfiles-verify.vercel.app
+FRONTEND_API_SECRET = environ.get('FRONTEND_API_SECRET', '')    # shared secret the frontend sends on every verify API call
+
+# Separate, higher-privilege secret for the admin dashboard's API calls
+# (ban, broadcast, indexing, etc.) — deliberately not the same value as
+# FRONTEND_API_SECRET above, so a compromise of the (lower-stakes) verify
+# flow's secret doesn't also grant admin control.
+ADMIN_API_SECRET = environ.get('ADMIN_API_SECRET', '')
 
 # ---- Misc behaviour ----
 PICS = (environ.get('PICS', 'https://graph.org/file/ce1723991756e48c35aa1.jpg')).split()

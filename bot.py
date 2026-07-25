@@ -91,11 +91,18 @@ class SCFilesBot(Client):
         logger.info("SC Files Bot stopped.")
 
 
-async def _web_server():
+async def _web_server(bot: "SCFilesBot"):
     async def ping(request):
         return web.Response(text="SC Files Bot is alive.")
     app = web.Application()
     app.add_routes([web.get('/', ping)])
+
+    from utils.frontend_api import register_routes
+    register_routes(app, bot)
+
+    from utils.admin_api import register_admin_routes
+    register_admin_routes(app, bot)
+
     return app
 
 
@@ -106,7 +113,7 @@ if __name__ == '__main__':
     async def main():
         bot = SCFilesBot()
         await bot.start()
-        runner = web.AppRunner(await _web_server())
+        runner = web.AppRunner(await _web_server(bot))
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", int(info.PORT))
         await site.start()
