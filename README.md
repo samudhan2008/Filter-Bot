@@ -486,3 +486,25 @@ A password-protected page for bot management without opening Telegram — stats,
 
 ### The frontend project
 Delivered separately (`scfiles_verify_frontend/`) since it deploys to Vercel, not this bot's Docker image. Built and verified with a real `next build` (not just a syntax check) — all 9 routes compile cleanly, including the JSX-heavy admin dashboard. Also bumped to Next.js `14.2.35` (the latest patched 14.x release; the version initially scaffolded, 14.2.5, had a known security advisory). Full setup/deployment instructions are in that project's own `README.md`.
+
+---
+
+## v23: fixed the actual verification bug + tightened security + website URL fix
+
+### The real bug: every file link was being shortened individually
+Root cause of what you saw ("each file had a shortlink, even after being verified for 24h"): `_file_button_rows` in `plugins/search.py` was shortening **every individual file's deep link** whenever `SHORTLINK_MODE` was on — a leftover from before the time-window verification system existed, never removed once it became redundant. File buttons are now always plain, unshortened deep links. The shortlink now only ever appears **once**, in the one-time verification prompt — exactly the time-window model you described (verify once, use any file for the whole window).
+
+### Verify before searching, not just before delivering
+Previously, the verification gate only fired when a user tapped a file button — the search itself (TMDB lookup, poster generation) still ran for non-verified users. Now, **in private chats**, a non-verified user gets the verify prompt immediately when they try to search at all, before any of that work happens — matching "ask them to verify first, then let them search."
+
+This is deliberately **PM-only** — worth explaining why: a group's search results are shared with everyone in the group, and gating the search on the specific person who typed the query would block every other (possibly already-verified) member from seeing results too. In groups, search stays open as before; verification is still enforced per-user, individually, at the moment each person taps a file's deep link — which is the correct point for a per-user check in a shared context.
+
+### Tightened security
+- **IP-consistency check** — the frontend now captures the requester's IP at both `/go` and `/finish`, and the bot compares them (coarse-grained: same /24 for IPv4, /64 for IPv6, not exact-match, since mobile networks legitimately rotate addresses mid-session). By default this is a *soft* signal — a mismatch is still accepted (the cookie is the strong cryptographic proof) but logged to `LOG_CHANNEL` for visibility. Set `STRICT_IP_CHECK=True` to make a mismatch a hard rejection instead, same as a cookie mismatch — only turn this on if you're seeing real abuse and are fine with occasionally rejecting a legitimate mobile user whose network genuinely changed mid-flow.
+- **Session-creation rate limit** — `VERIFY_SESSION_COOLDOWN` (default 15s) — a user can't be handed a fresh verification session more than once per cooldown window, which makes it pointless for a script to rapid-fire requests probing the session system.
+- New env vars: `STRICT_IP_CHECK` (default `False`), `VERIFY_SESSION_COOLDOWN` (default `15`).
+
+### Website URL for series
+`backend.website_link()` now points series at `{WEBSITE_URL}/pages/series?id=...` instead of `{WEBSITE_URL}/series?id=...`. Movies are unchanged (`{WEBSITE_URL}/movie?id=...`).
+
+**Requires the matching frontend update too** (see that project's own changelog) — both projects need to be redeployed together for this round.

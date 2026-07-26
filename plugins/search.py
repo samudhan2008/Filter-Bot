@@ -9,7 +9,7 @@ from pyrogram.enums import ChatType
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 import info
-from database import filesdb, usersdb, backend, statedb
+from database import filesdb, usersdb, backend, statedb, verifydb
 from plugins.group_auth import group_is_allowed, _is_group_admin
 from plugins.force_sub import is_subscribed, fsub_markup
 from utils import tmdb, poster, query as queryutil, texts
@@ -37,19 +37,22 @@ async def _new_result_entry(files, query, season, episode, offset, max_results, 
 
 
 async def _file_button_rows(bot: Client, files):
-    """One button per file, always a t.me/<bot>?start=file_<id> deep link —
-    which, being a real Telegram deep link, always opens the clicker's own
-    PM regardless of where the button was pressed, and always maps to
-    exactly one file, so there's no ambiguity about which file a tap
-    delivers. Shortened via SHORTLINK_URL/API when SHORTLINK_MODE is on;
-    actual delivery (and, when enabled, the anti-bypass verification gate)
-    happens in plugins/start.py's /start file_<id> handler."""
+    """One button per file, always a plain t.me/<bot>?start=file_<id> deep
+    link — never shortened here. Being a real Telegram deep link, it
+    always opens the clicker's own PM regardless of where the button was
+    pressed, and always maps to exactly one file, so there's no ambiguity
+    about which file a tap delivers.
+
+    The shortlink (when SHORTLINK_MODE is on) belongs *only* to the
+    one-time verification step in plugins/start.py's deliver_file — once a
+    user is verified, every file link works directly for the rest of
+    their verification window. Shortening every individual file link here
+    would put a shortlink between the user and every single file, every
+    time, defeating the whole point of the time-window verification model.
+    """
     rows = []
     for f in files:
         deep_link = f"https://t.me/{bot.username}?start=file_{f['file_id']}"
-        if info.SHORTLINK_MODE:
-            from utils.shortlink import shorten
-            deep_link = await shorten(deep_link)
         rows.append([InlineKeyboardButton(
             texts.FILE_BUTTON_LABEL.format(name=f['file_name'][:55], size=human_size(f['file_size'])),
             url=deep_link,
@@ -122,6 +125,24 @@ async def on_search_text(bot: Client, message: Message):
     if user and not await is_subscribed(bot, user.id):
         markup = await fsub_markup(bot)
         return await message.reply("👋 Please join our channel first to search files.", reply_markup=markup)
+
+    # In PM, don't even run the search for a non-verified user when
+    # SHORTLINK_MODE is on — verify first, search after. This is
+    # deliberately PM-only: gating a *group* search on whoever happened to
+    # type the query would block every other (possibly already-verified)
+    # member from seeing results too, which isn't the intent. In groups,
+    # search stays open for everyone, and verification is still enforced
+    # per-user at file-delivery time when they tap a file's deep link.
+    if (
+        message.chat.type == ChatType.PRIVATE
+        and info.SHORTLINK_MODE
+        and info.FRONTEND_URL
+        and info.FRONTEND_API_SECRET
+        and user
+        and not await verifydb.is_verified(user.id)
+    ):
+        from plugins.start import send_verify_prompt
+        return await send_verify_prompt(bot, message)
 
     raw_query = message.text.strip()
     if len(raw_query) < 2:

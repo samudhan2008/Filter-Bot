@@ -119,5 +119,6 @@ async def find_entry(kind: str, tmdb_id, title: str = ""):
 
 
 def website_link(kind: str, entry: dict) -> str:
-    path = "movie" if kind == "movie" else "series"
-    return f"{info.WEBSITE_URL}/{path}?id={entry.get('id')}"
+    if kind == "movie":
+        return f"{info.WEBSITE_URL}/movie?id={entry.get('id')}"
+    return f"{info.WEBSITE_URL}/pages/series?id={entry.get('id')}"

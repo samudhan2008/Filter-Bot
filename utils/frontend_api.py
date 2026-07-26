@@ -31,10 +31,11 @@ async def api_set_cookie(request: web.Request):
         data = await request.json()
         session_id = str(data['session_id'])
         cookie = str(data['cookie'])
+        ip = data.get('ip')
     except Exception:
         return web.json_response({'ok': False, 'error': 'bad request'}, status=400)
 
-    ok = await verifydb.set_session_cookie(session_id, cookie)
+    ok = await verifydb.set_session_cookie(session_id, cookie, ip)
     return web.json_response({'ok': ok})
 
 
@@ -45,12 +46,24 @@ async def api_confirm(request: web.Request):
         data = await request.json()
         session_id = str(data['session_id'])
         cookie = data.get('cookie')  # may legitimately be missing/None — that's a mismatch, not a bad request
+        ip = data.get('ip')
     except Exception:
         return web.json_response({'ok': False, 'error': 'bad request'}, status=400)
 
-    status, user_id = await verifydb.confirm_session(session_id, cookie)
+    status, user_id = await verifydb.confirm_session(session_id, cookie, ip)
 
-    if status == "ok":
+    if status in ("ok", "ok_flagged"):
+        if status == "ok_flagged" and info.LOG_CHANNEL:
+            bot: Client = request.app.get('bot_client')
+            if bot:
+                try:
+                    await bot.send_message(
+                        info.LOG_CHANNEL,
+                        f"⚠️ Verification for user <code>{user_id}</code> succeeded but its IP looked "
+                        "inconsistent between steps — allowed (cookie matched), flagged for visibility.",
+                    )
+                except Exception:
+                    pass
         return web.json_response({'ok': True})
 
     if status == "mismatch" and user_id:

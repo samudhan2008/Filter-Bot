@@ -63,7 +63,7 @@ async def deliver_file(bot: Client, message: Message, file_id: str):
     if info.SHORTLINK_MODE:
         if info.FRONTEND_URL and info.FRONTEND_API_SECRET:
             if not await verifydb.is_verified(message.from_user.id):
-                return await _send_verify_prompt(bot, message)
+                return await send_verify_prompt(bot, message)
         else:
             logger.warning(
                 "SHORTLINK_MODE is on but FRONTEND_URL/FRONTEND_API_SECRET aren't configured — "
@@ -89,7 +89,12 @@ async def deliver_file(bot: Client, message: Message, file_id: str):
         await message.reply("❌ Couldn't send that file. It may have expired — please search again.")
 
 
-async def _send_verify_prompt(bot: Client, message: Message):
+async def send_verify_prompt(bot: Client, message: Message):
+    if not await verifydb.can_create_session(message.from_user.id):
+        return await message.reply(
+            "⏳ Give it a few seconds and try again — a verification link was just requested for your account."
+        )
+
     from utils.shortlink import shorten
 
     session_id = await verifydb.create_session(message.from_user.id)
@@ -103,7 +108,7 @@ async def _send_verify_prompt(bot: Client, message: Message):
         "do this occasionally, not on every file.\n\n"
         "⚠️ Please complete it normally (don't skip ahead using a saved link) — bypass attempts are "
         "detected and flagged.\n\n"
-        "Once verified, come back and tap the file button again.",
+        "Once verified, come back and search or tap a file button again.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Verify Now", url=go_url)]]),
     )
 
