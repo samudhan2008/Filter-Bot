@@ -126,16 +126,16 @@ async def on_search_text(bot: Client, message: Message):
         markup = await fsub_markup(bot)
         return await message.reply("👋 Please join our channel first to search files.", reply_markup=markup)
 
-    # In PM, don't even run the search for a non-verified user when
-    # SHORTLINK_MODE is on — verify first, search after. This is
-    # deliberately PM-only: gating a *group* search on whoever happened to
-    # type the query would block every other (possibly already-verified)
-    # member from seeing results too, which isn't the intent. In groups,
-    # search stays open for everyone, and verification is still enforced
-    # per-user at file-delivery time when they tap a file's deep link.
+    # Don't even run the search for a non-verified user when SHORTLINK_MODE
+    # is on — verify first, search after. This is per-user (checks whoever
+    # sent *this* message), so in a group it only gates that person's own
+    # search request — other members typing their own queries are
+    # unaffected either way. Verification is still additionally enforced
+    # at file-delivery time when someone taps a file's deep link, which
+    # matters since anyone in a group can tap a button on someone else's
+    # result.
     if (
-        message.chat.type == ChatType.PRIVATE
-        and info.SHORTLINK_MODE
+        info.SHORTLINK_MODE
         and info.FRONTEND_URL
         and info.FRONTEND_API_SECRET
         and user

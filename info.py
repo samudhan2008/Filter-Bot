@@ -101,13 +101,15 @@ VERIFY_VALID_HOURS = int(environ.get('VERIFY_VALID_HOURS', '24'))     # how long
 VERIFY_SESSION_TTL = int(environ.get('VERIFY_SESSION_TTL', '900'))     # seconds to complete the whole shortlink round trip
 VERIFY_SESSION_COOLDOWN = int(environ.get('VERIFY_SESSION_COOLDOWN', '15'))  # min seconds between new sessions per user
 
-# If True, a verification whose IP moved to a different /24 (IPv4) or /64
-# (IPv6) network between /go and /finish is rejected outright, same as a
-# cookie mismatch. If False (default), it's still accepted — the cookie is
-# the strong proof, and mobile networks legitimately rotate IPs mid-session
-# — but logged for visibility. Turn this on only if you're seeing real
-# abuse and are OK with occasionally rejecting a legitimate mobile user.
-STRICT_IP_CHECK = is_enabled(environ.get('STRICT_IP_CHECK', 'False'), False)
+# If True (default), a verification whose IP moved to a different /24
+# (IPv4) or /64 (IPv6) network between /go and /finish is rejected
+# outright, same as a cookie mismatch. If False, it's still accepted — the
+# cookie is the strong proof — but logged for visibility instead of
+# rejected. Worth knowing: with this on, a legitimate user whose mobile
+# network genuinely reassigns their IP mid-flow (switching towers, wifi to
+# data, etc.) can occasionally get rejected and have to verify again — a
+# real tradeoff for the extra strictness, not a bug if you see it happen.
+STRICT_IP_CHECK = is_enabled(environ.get('STRICT_IP_CHECK', 'True'), True)
 
 # The Vercel frontend that runs the cookie-continuity check (see the
 # separate frontend/ project). Both must be set for the verification flow

@@ -508,3 +508,28 @@ This is deliberately **PM-only** — worth explaining why: a group's search resu
 `backend.website_link()` now points series at `{WEBSITE_URL}/pages/series?id=...` instead of `{WEBSITE_URL}/series?id=...`. Movies are unchanged (`{WEBSITE_URL}/movie?id=...`).
 
 **Requires the matching frontend update too** (see that project's own changelog) — both projects need to be redeployed together for this round.
+
+---
+
+## v24: verify-before-search now applies in groups too, STRICT_IP_CHECK on by default
+
+- **Verify-before-search widened to groups.** On reflection the earlier PM-only restriction was overly cautious — the gate checks the specific sender (`message.from_user.id`), so it only ever affected that one person's own search request, never blocked anyone else's. Now it applies everywhere: a non-verified user gets the verify prompt immediately when they try to search, in PM or in a group, before any TMDB/poster work happens.
+- **`STRICT_IP_CHECK` now defaults to `True`.** A verification whose IP moved to a different /24 (IPv4) or /64 (IPv6) network between `/go` and `/finish` is now rejected outright by default, same as a cookie mismatch — not just logged. Worth knowing the tradeoff this brings: a legitimate user whose mobile network genuinely reassigns their IP mid-flow (switching towers, wifi to mobile data, etc.) can occasionally get rejected and need to verify again. Set `STRICT_IP_CHECK=False` to go back to the softer "log but allow" behavior if that turns out to cause more false positives than you want.
+
+---
+
+## v25: admin panel — new backend capabilities for the redesigned frontend
+
+New bot-side additions backing this round's frontend overhaul (see that project's own changelog for the UI side):
+
+- **`database/auditdb.py`** — every mutating admin-panel action (ban, unban, broadcast, auth/unauth, indexing start/finish, backend cache refresh) is now logged with a timestamp and details, kept for 30 days. The panel uses one shared password rather than per-admin logins, so this can't attribute an action to a specific person, but it gives a clear record of *what happened, when* — worth having given this panel can ban users and message your whole audience.
+- **New endpoints in `utils/admin_api.py`**:
+  - `GET /api/admin/health` — bot online status, MongoDB ping, TMDB/backend circuit-breaker state, uptime, memory usage.
+  - `GET /api/admin/user?user_id=` — look up a specific user's known/banned/verified status and verification expiry.
+  - `GET /api/admin/poster_cache` — disk-cached poster count/size plus how many are archived in `POSTER_CHANNEL`.
+  - `POST /api/admin/backend_refresh` — force-refresh the SC Files backend's movies/series cache on demand.
+  - `GET /api/admin/search_files?q=` — search indexed files directly, for quick "is this actually in the DB" checks without opening Telegram.
+  - `GET /api/admin/audit_log` — the last 50 logged admin actions.
+  - `stats` now also reports `currently_verified` (count of users with a live verification window).
+
+No new env vars on the bot side for this round — everything above uses the existing `ADMIN_API_SECRET`.
