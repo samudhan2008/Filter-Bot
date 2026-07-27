@@ -3,13 +3,19 @@ Builds the landscape poster shown with every search result:
 TMDB backdrop + a dark gradient at the bottom + the title logo overlaid
 (or, if TMDB has no logo for that title, the title drawn as text instead).
 
-Three cache tiers, in order:
-1. On-disk cache (POSTER_CACHE_DIR) — fastest, but local to this instance
-   and lost on restart/redeploy.
-2. Telegram-channel-backed Mongo cache (POSTER_CHANNEL, database/postersdb.py)
+Cache tiers, in order:
+1. Telegram-channel-backed Mongo cache (POSTER_CHANNEL, database/postersdb.py)
    — once a poster's been generated, its file_id is archived and reused
    directly (photo=file_id) with no bytes touched at all on a hit. Survives
-   restarts. Optional — off if POSTER_CHANNEL isn't set.
+   restarts. Optional — off if POSTER_CHANNEL isn't set. Self-healing: each
+   cached entry remembers whether it actually had a real backdrop/logo or
+   fell back to a plain background/drawn title because TMDB didn't have
+   one yet — if TMDB has since added what was missing, this regenerates
+   and edits the existing archived message in place instead of serving the
+   stale fallback forever.
+2. On-disk cache (POSTER_CACHE_DIR) — fast, but local to this instance and
+   lost on restart/redeploy. Skipped when self-healing kicks in, so it
+   can't serve a stale incomplete poster either.
 3. Generate fresh — backdrop + logo fetched concurrently, then composited
    in a worker thread (asyncio.to_thread) so it doesn't block the event
    loop for other concurrent requests.
@@ -179,11 +185,25 @@ def _composite_sync(title: str, backdrop_bytes, logo_bytes, backdrop_is_portrait
     return data
 
 
-async def _resolve_with_channel_cache(bot, cache_key, kind: str, generate_coro):
+async def _resolve_with_channel_cache(bot, cache_key, kind: str, generate_coro,
+                                       has_backdrop_now: bool = True, has_logo_now: bool = True):
     """
-    3-tier lookup: disk cache (fastest, this instance only) -> Telegram-
-    channel-backed Mongo cache (persistent, near-zero cost on hit) ->
-    generate fresh (the only tier that actually costs memory/CPU/network).
+    3-tier lookup: Telegram-channel-backed Mongo cache (persistent,
+    near-zero cost on hit, and self-healing — see below) -> on-disk cache
+    (fast, this instance only) -> generate fresh (the only tier that
+    actually costs memory/CPU/network).
+
+    Self-healing: every cached poster remembers whether it actually had a
+    real backdrop/logo when it was built, or fell back to a plain
+    background / drawn-text title because TMDB didn't have one *yet*.
+    TMDB entries get artwork added over time — a title searched the day it
+    was announced might have neither, then gain a backdrop and logo weeks
+    later. Without this check, a poster generated during that gap would
+    stay stuck at the fallback version forever. So: if the cache says
+    something was missing, and the caller's current has_backdrop_now/
+    has_logo_now says it's available *now*, this regenerates and — instead
+    of posting a new message to POSTER_CHANNEL — edits the existing
+    cached message in place, updating its stored file_id.
 
     Returns (ref, is_file_id):
       is_file_id=True  -> ref is a Telegram file_id string; send via
@@ -193,17 +213,37 @@ async def _resolve_with_channel_cache(bot, cache_key, kind: str, generate_coro):
     generate_coro: async callable, no args, returning fresh PNG bytes (or
     None on failure).
     """
-    if cache_key is not None:
+    mongo_doc = None
+    mongo_key = f"{kind}_{cache_key}" if cache_key is not None else None  # namespaced so a movie and a series can't collide on the same tmdb_id
+
+    if mongo_key is not None and info.POSTER_CHANNEL and bot is not None:
+        from database import postersdb
+        mongo_doc = await postersdb.get_poster_doc(mongo_key)
+
+    needs_heal = False
+    if mongo_doc:
+        # Records from before this feature existed have neither field at
+        # all — treat "unknown" the same as "was missing" so an existing
+        # incomplete poster (built before self-healing existed) actually
+        # gets re-checked the next time it's searched, not just ones
+        # cached going forward. This means every pre-upgrade cached poster
+        # gets one re-verification pass on its next hit — a bounded,
+        # one-time cost, not a recurring one, since the doc gets the real
+        # fields filled in immediately after.
+        was_missing_backdrop = not mongo_doc.get('has_backdrop', False)
+        was_missing_logo = not mongo_doc.get('has_logo', False)
+        if (was_missing_backdrop and has_backdrop_now) or (was_missing_logo and has_logo_now):
+            needs_heal = True
+            logger.info(f"Self-healing poster {mongo_key}: backdrop {was_missing_backdrop}->{has_backdrop_now}, "
+                        f"logo {was_missing_logo}->{has_logo_now}")
+
+    if mongo_doc and not needs_heal:
+        return mongo_doc['file_id'], True
+
+    if cache_key is not None and not needs_heal:
         cached = _cached(cache_key, kind)
         if cached is not None:
             return cached, False
-
-        if info.POSTER_CHANNEL and bot is not None:
-            from database import postersdb
-            mongo_key = f"{kind}_{cache_key}"  # namespaced so a movie and a series can't collide on the same tmdb_id
-            file_id = await postersdb.get_poster_file_id(mongo_key)
-            if file_id:
-                return file_id, True
 
     data = await generate_coro()
     if not data:
@@ -214,16 +254,27 @@ async def _resolve_with_channel_cache(bot, cache_key, kind: str, generate_coro):
 
         if info.POSTER_CHANNEL and bot is not None:
             from database import postersdb
-            mongo_key = f"{kind}_{cache_key}"
+            from pyrogram.types import InputMediaPhoto
             try:
-                buf = io.BytesIO(data)
-                buf.name = "poster.png"
-                msg = await bot.send_photo(info.POSTER_CHANNEL, photo=buf, caption=f"🗄 {mongo_key}")
-                buf.close()
+                if needs_heal and mongo_doc and mongo_doc.get('message_id'):
+                    buf = io.BytesIO(data)
+                    buf.name = "poster.png"
+                    msg = await bot.edit_message_media(
+                        chat_id=info.POSTER_CHANNEL,
+                        message_id=mongo_doc['message_id'],
+                        media=InputMediaPhoto(buf, caption=f"🗄 {mongo_key} (healed — artwork updated)"),
+                    )
+                    buf.close()
+                else:
+                    buf = io.BytesIO(data)
+                    buf.name = "poster.png"
+                    msg = await bot.send_photo(info.POSTER_CHANNEL, photo=buf, caption=f"🗄 {mongo_key}")
+                    buf.close()
                 if msg and msg.photo:
-                    await postersdb.save_poster_file_id(mongo_key, msg.photo.file_id, kind)
+                    await postersdb.save_poster(mongo_key, msg.photo.file_id, msg.id, kind,
+                                                 has_backdrop_now, has_logo_now)
             except Exception as e:
-                logger.warning(f"Could not archive poster to POSTER_CHANNEL: {e}")
+                logger.warning(f"Could not archive/heal poster in POSTER_CHANNEL: {e}")
 
     return data, False
 
@@ -242,7 +293,9 @@ async def build_full_poster(bot, poster_path: str, tmdb_id=None, kind: str = "se
     async def _generate():
         return await _fetch_bytes(tmdb.poster_url(poster_path))
 
-    return await _resolve_with_channel_cache(bot, cache_key, kind, _generate)
+    # No logo concept in this mode — only backdrop (i.e. the poster itself)
+    # completeness is tracked.
+    return await _resolve_with_channel_cache(bot, cache_key, kind, _generate, has_backdrop_now=True, has_logo_now=True)
 
 
 async def build_poster(bot, title: str, backdrop_path: str, logo_url: str = None, tmdb_id=None, kind: str = "movie",
@@ -263,4 +316,7 @@ async def build_poster(bot, title: str, backdrop_path: str, logo_url: str = None
         )
         return await asyncio.to_thread(_composite_sync, title, backdrop_bytes, logo_bytes, backdrop_is_portrait)
 
-    return await _resolve_with_channel_cache(bot, cache_key, kind, _generate)
+    return await _resolve_with_channel_cache(
+        bot, cache_key, kind, _generate,
+        has_backdrop_now=bool(backdrop_path), has_logo_now=bool(logo_url),
+    )

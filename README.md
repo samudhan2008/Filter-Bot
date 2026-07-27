@@ -533,3 +533,22 @@ New bot-side additions backing this round's frontend overhaul (see that project'
   - `stats` now also reports `currently_verified` (count of users with a live verification window).
 
 No new env vars on the bot side for this round — everything above uses the existing `ADMIN_API_SECRET`.
+
+---
+
+## v26: self-healing posters — fixes cached posters stuck with no backdrop/logo
+
+### The loophole
+Once a poster was generated and cached (disk + `POSTER_CHANNEL` + Mongo), it stayed exactly as it was **forever** — including the fallback version (plain dark background, drawn-text title) used when TMDB didn't have a backdrop or logo *at that moment*. TMDB entries gain artwork over time as contributors upload it, so a title searched right when it was announced could get stuck showing the ugly fallback indefinitely, even after TMDB had a proper backdrop and logo weeks later — exactly what you found with "Anbe Diana."
+
+### The fix
+`database/postersdb.py`'s cached-poster records now track `has_backdrop` / `has_logo` — whether the cached version actually had real artwork, or fell back. Every search already re-resolves the current TMDB backdrop/logo availability fresh (nothing new needed there) — `utils/poster.py` now compares that against what the cache recorded:
+
+- If the cache says something was missing, and it's available now → **regenerates the poster and edits the existing archived message in `POSTER_CHANNEL` in place** (via `edit_message_media`), rather than posting a duplicate — same message, updated image, updated stored `file_id`.
+- If the cache was already complete, or nothing new is available → behaves exactly as before, zero extra cost.
+- **Existing posters cached before this update** (which have neither field recorded at all) are treated as "unknown, worth re-checking" — so poster like the one in your screenshot get picked up and healed automatically the next time that title is searched, not just new ones going forward. This is a one-time re-verification per title, not a recurring cost — once healed (or confirmed complete), the record gets real values and future hits are fast again.
+
+### Admin panel visibility
+The dashboard's Poster Cache card now also shows **Incomplete** (archived posters known to be missing backdrop and/or logo) and **Unverified** (pre-upgrade posters not yet re-checked) counts, so you can see the healing backlog shrink over time instead of it being invisible.
+
+**One thing I can't verify from here:** `edit_message_media` is a core Telegram Bot API method, not a pyromod convenience wrapper (unlike a couple of methods from earlier rounds that turned out missing on this pyrofork build), so I'm fairly confident it's present — but I don't have a live bot to actually exercise this edit against a real channel message. Worth testing directly: find a poster with a missing backdrop/logo (or just wait for TMDB to add art to something recently cached incomplete), search it again, and confirm the existing channel message actually gets replaced in place rather than erroring out silently into a logged warning.

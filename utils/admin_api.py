@@ -139,12 +139,20 @@ async def api_poster_cache_stats(request: web.Request):
 
     from database import postersdb
     archived_count = await postersdb.posters_col.count_documents({})
+    incomplete_count = await postersdb.posters_col.count_documents({
+        '$or': [{'has_backdrop': False}, {'has_logo': False}]
+    })
+    unverified_count = await postersdb.posters_col.count_documents({
+        'has_backdrop': {'$exists': False}
+    })
 
     return web.json_response({
         'ok': True,
         'disk_cached_files': count,
         'disk_cache_mb': round(total_bytes / (1024 * 1024), 2),
         'archived_in_channel': archived_count,
+        'known_incomplete': incomplete_count,
+        'unverified_pre_upgrade': unverified_count,
     })
 
 
