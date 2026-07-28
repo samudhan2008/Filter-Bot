@@ -552,3 +552,17 @@ Once a poster was generated and cached (disk + `POSTER_CHANNEL` + Mongo), it sta
 The dashboard's Poster Cache card now also shows **Incomplete** (archived posters known to be missing backdrop and/or logo) and **Unverified** (pre-upgrade posters not yet re-checked) counts, so you can see the healing backlog shrink over time instead of it being invisible.
 
 **One thing I can't verify from here:** `edit_message_media` is a core Telegram Bot API method, not a pyromod convenience wrapper (unlike a couple of methods from earlier rounds that turned out missing on this pyrofork build), so I'm fairly confident it's present — but I don't have a live bot to actually exercise this edit against a real channel message. Worth testing directly: find a poster with a missing backdrop/logo (or just wait for TMDB to add art to something recently cached incomplete), search it again, and confirm the existing channel message actually gets replaced in place rather than erroring out silently into a logged warning.
+
+---
+
+## v27: self-healing was creating new messages instead of editing
+
+### Root cause
+Every poster cached **before** the self-healing feature existed was saved with only its `file_id` — the old code never stored `message_id` at all, since there was no reason to before. The healing logic required `message_id` to call `edit_message_media` (Telegram has no way to edit a message without knowing its ID), so for essentially your entire pre-existing poster cache, that check failed and it silently fell through to posting a brand-new message every time, instead of editing.
+
+### What's fixed
+- **This should now genuinely self-correct after one time per title.** The very first heal of a pre-existing cached poster still has to create a new message (unavoidable — there's no message ID on record to edit), but that new message's ID now gets saved properly, so **every update after that first one edits in place** as intended. If you search the same title a second time after it's been healed once and it *still* creates a new message instead of editing, that's a genuine remaining bug worth reporting back with the log lines (see below).
+- **Added explicit logging** so this is actually diagnosable instead of a black box — you'll now see one of three distinct log lines: `"Healed poster ...: edited existing message ... in place"`, `"no message_id on record ... posting a fresh archive message this one time"` (the expected one-time migration cost), or a warning if `edit_message_media` genuinely failed and it fell back to a new message.
+- **Fixed a related bug this surfaced**: previously, if `edit_message_media` failed for *any* reason (message deleted from the channel, a transient error, etc.), the whole operation aborted with no fallback at all — the archive just silently stopped updating for that poster. It now properly falls back to posting a new message if editing fails, so the archive never gets stuck.
+
+If new messages keep appearing for titles you've *already* seen healed once, that's the thing to send back — a log excerpt showing which of the three cases above it's hitting will tell us immediately whether it's still the migration gap (expected) or something else.

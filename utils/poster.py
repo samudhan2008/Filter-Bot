@@ -255,8 +255,12 @@ async def _resolve_with_channel_cache(bot, cache_key, kind: str, generate_coro,
         if info.POSTER_CHANNEL and bot is not None:
             from database import postersdb
             from pyrogram.types import InputMediaPhoto
-            try:
-                if needs_heal and mongo_doc and mongo_doc.get('message_id'):
+
+            can_edit = needs_heal and mongo_doc and mongo_doc.get('message_id')
+            msg = None
+
+            if can_edit:
+                try:
                     buf = io.BytesIO(data)
                     buf.name = "poster.png"
                     msg = await bot.edit_message_media(
@@ -265,16 +269,32 @@ async def _resolve_with_channel_cache(bot, cache_key, kind: str, generate_coro,
                         media=InputMediaPhoto(buf, caption=f"🗄 {mongo_key} (healed — artwork updated)"),
                     )
                     buf.close()
-                else:
+                    logger.info(f"Healed poster {mongo_key}: edited existing message {mongo_doc['message_id']} in place.")
+                except Exception as e:
+                    logger.warning(f"edit_message_media failed for {mongo_key} (message {mongo_doc['message_id']}), "
+                                    f"falling back to a new message: {e}")
+                    msg = None
+
+            if msg is None:
+                if needs_heal and mongo_doc and not mongo_doc.get('message_id'):
+                    logger.info(f"Healing {mongo_key}: no message_id on record (cached before self-healing "
+                                f"existed) — posting a fresh archive message this one time. From its next "
+                                f"update onward this will edit in place instead.")
+                try:
                     buf = io.BytesIO(data)
                     buf.name = "poster.png"
                     msg = await bot.send_photo(info.POSTER_CHANNEL, photo=buf, caption=f"🗄 {mongo_key}")
                     buf.close()
-                if msg and msg.photo:
+                except Exception as e:
+                    logger.warning(f"Could not archive poster {mongo_key} to POSTER_CHANNEL: {e}")
+
+            if msg and msg.photo:
+                try:
                     await postersdb.save_poster(mongo_key, msg.photo.file_id, msg.id, kind,
                                                  has_backdrop_now, has_logo_now)
-            except Exception as e:
-                logger.warning(f"Could not archive/heal poster in POSTER_CHANNEL: {e}")
+                except Exception as e:
+                    logger.warning(f"Archived/edited poster {mongo_key} in Telegram but failed to save the "
+                                    f"record to Mongo — it'll be treated as needing another look next time: {e}")
 
     return data, False
 
