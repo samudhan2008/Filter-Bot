@@ -450,18 +450,41 @@ async def on_pick_episode(bot: Client, cq: CallbackQuery):
     )
 
 
+async def _search_with_year_fallback(query: str, max_results: int, season, episode, year):
+    """
+    Same file search, but tries to disambiguate two different titles that
+    happen to share the exact same name but released in different years
+    (remakes, regional versions, etc.) — if `year` is given, filters to
+    it first. Not every file is tagged with a parsed release year, though,
+    so if that filter finds nothing, this retries without it rather than
+    reporting a false "no files" for a title that's actually there.
+    """
+    if year is not None:
+        files, _, total = await filesdb.get_search_results(
+            query, max_results=max_results, offset=0, season=season, episode=episode, year=year
+        )
+        if files:
+            return files, total
+    files, _, total = await filesdb.get_search_results(
+        query, max_results=max_results, offset=0, season=season, episode=episode
+    )
+    return files, total
+
+
 async def _show_result(bot: Client, message: Message, candidate: dict, clean_query: str,
                         season=None, episode=None, reply_chat=None, status_msg=None):
     chat_id = reply_chat or message.chat.id
     kind = candidate["kind"]  # 'movie' or 'series'
     title = candidate["title"]
+    year = candidate.get("year")
+    year = int(year) if year else None
     max_results = info.MAX_RESULTS
 
     effective_query = title
-    files, _, total = await filesdb.get_search_results(title, max_results=max_results, offset=0, season=season, episode=episode)
+    files, total = await _search_with_year_fallback(title, max_results, season, episode, year)
     if not files:
         effective_query = clean_query
-        files, _, total = await filesdb.get_search_results(clean_query, max_results=max_results, offset=0, season=season, episode=episode)
+        files, total = await _search_with_year_fallback(clean_query, max_results, season, episode, year)
     if not files:
         if status_msg:
             try:
