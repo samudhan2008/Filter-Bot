@@ -23,7 +23,7 @@ from umongo import Instance, Document, fields
 from marshmallow.exceptions import ValidationError
 
 import info
-from utils.query import extract_episode
+from utils.query import extract_episode, extract_year
 from utils.cache import TTLCache
 from database.mongo import db, client
 
@@ -54,6 +54,12 @@ class Media(Document):
     # other search path is unaffected.
     squeezed_name = fields.StrField(allow_none=True)
     squeezed_caption = fields.StrField(allow_none=True)
+    # Release year parsed from the filename (or caption, as a fallback) at
+    # index time — lets search disambiguate two different titles that
+    # happen to share the exact same name but released in different years
+    # (remakes, regional versions, etc.). None when neither the filename
+    # nor caption mentions a year.
+    release_year = fields.IntField(allow_none=True)
 
     class Meta:
         indexes = ('$normalized_name',)
@@ -81,9 +87,21 @@ async def ensure_indexes():
 # name and every incoming query go through this before matching.
 _SEP_RE = re.compile(r"[^a-z0-9]+")
 
+# Apostrophes (straight/curly/backtick) sit *inside* a word — a possessive
+# or contraction like "Nobita's" — not between two words. Stripping them
+# outright (rather than treating them as a separator like _SEP_RE does)
+# keeps "Nobita's" as one token, "nobitas", on both the query and the
+# stored-name side. Without this, "Nobita's" -> "nobita" + a standalone,
+# meaningless "s" token, which the word-fallback pass would then treat as
+# a real search term — matching almost any other file with an apostrophe
+# in its name (e.g. "Watchman's" -> "watchman" + "s") and returning wildly
+# unrelated results.
+_APOSTROPHE_RE = re.compile(r"[\u2019\u2018'`]")
+
 
 def normalize(text: str) -> str:
-    return _SEP_RE.sub(" ", (text or "").lower()).strip()
+    text = _APOSTROPHE_RE.sub("", (text or "").lower())
+    return _SEP_RE.sub(" ", text).strip()
 
 
 def encode_file_id(s: bytes) -> str:
@@ -118,6 +136,11 @@ def _doc_from_media(media):
     _, season, episode = extract_episode(name)
     norm_name = normalize(name)
     caption_html = media.caption.html if media.caption else None
+
+    _, release_year = extract_year(name)
+    if release_year is None and caption_html:
+        _, release_year = extract_year(caption_html)
+
     return {
         '_id': file_id,
         'file_ref': file_ref,
@@ -133,6 +156,7 @@ def _doc_from_media(media):
         'indexed_at': datetime.now(timezone.utc),
         'squeezed_name': norm_name.replace(' ', ''),
         'squeezed_caption': normalize(caption_html).replace(' ', '') if caption_html else None,
+        'release_year': release_year,
     }
 
 
@@ -146,6 +170,7 @@ async def save_file(media):
             season_number=doc['season_number'], ep_number=doc['ep_number'],
             file_date=doc['file_date'], indexed_at=doc['indexed_at'],
             squeezed_name=doc['squeezed_name'], squeezed_caption=doc['squeezed_caption'],
+            release_year=doc['release_year'],
         )
     except ValidationError:
         logger.exception('Error building Media doc')
@@ -218,7 +243,15 @@ _STOPWORDS = {
 }
 
 
-def _base_filter(file_type, season, episode):
+def _is_significant_word(word: str) -> bool:
+    """Same reasoning as _STOPWORDS, plus a length floor: a 1-2 letter
+    token (whether a stray normalization artifact or just genuinely short)
+    matches so many unrelated files in an OR-based fallback that it isn't
+    worth treating as a real search term there."""
+    return len(word) >= 3 and word not in _STOPWORDS
+
+
+def _base_filter(file_type, season, episode, year=None):
     filt = {}
     if file_type:
         filt['file_type'] = file_type
@@ -226,10 +259,12 @@ def _base_filter(file_type, season, episode):
         filt['season_number'] = season
     if episode is not None:
         filt['ep_number'] = episode
+    if year is not None:
+        filt['release_year'] = year
     return filt
 
 
-async def get_search_results(query, file_type=None, max_results=None, offset=0, season=None, episode=None):
+async def get_search_results(query, file_type=None, max_results=None, offset=0, season=None, episode=None, year=None):
     """
     Two-pass search, with pass 2 only ever used when pass 1 finds nothing:
 
@@ -241,9 +276,16 @@ async def get_search_results(query, file_type=None, max_results=None, offset=0, 
        matches any one of them, so e.g. a file named just "hello.mkv"
        still turns up for a query "hi hello" that otherwise matches
        nothing exactly.
+
+    `year`, when given, filters to files whose parsed release_year matches
+    — for disambiguating two different titles that happen to share the
+    exact same name but released in different years. Callers are expected
+    to retry without it if it finds nothing (not every file is tagged with
+    a year), same pattern as season/episode — see plugins/search.py's
+    _search_with_fallback.
     """
     max_results = max_results or info.MAX_RESULTS
-    base = _base_filter(file_type, season, episode)
+    base = _base_filter(file_type, season, episode, year)
     words = [w for w in normalize(query).split(' ') if w]
     coll = Media.collection
     recency_sort = [('file_date', -1), ('indexed_at', -1)]
@@ -278,7 +320,7 @@ async def get_search_results(query, file_type=None, max_results=None, offset=0, 
     total2 = 0
     word_filt = None
     if total1 == 0 and len(words) > 1:
-        significant_words = [w for w in words if w not in _STOPWORDS]
+        significant_words = [w for w in words if _is_significant_word(w)]
         if significant_words:
             regex_any = _build_regex_any(significant_words)
             word_filt = {**base, 'normalized_name': regex_any}
