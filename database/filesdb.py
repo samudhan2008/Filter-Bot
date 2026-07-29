@@ -75,9 +75,19 @@ async def ensure_indexes():
         await Media.collection.create_index([('file_name', TEXT), ('caption', TEXT)], name='scfiles_text_idx')
         await Media.collection.create_index('season_number')
         await Media.collection.create_index('ep_number')
-        await Media.collection.create_index([('file_date', DESCENDING), ('indexed_at', DESCENDING)],
+        await Media.collection.create_index('release_year')
+
+        # The recency index's field order changed (indexed_at is now
+        # primary, not file_date) — Mongo rejects re-creating an index
+        # under the same name with different keys, so the old one needs
+        # dropping first rather than silently failing to update.
+        try:
+            await Media.collection.drop_index('scfiles_recency_idx')
+        except Exception:
+            pass  # didn't exist yet — fine
+        await Media.collection.create_index([('indexed_at', DESCENDING), ('file_date', DESCENDING)],
                                              name='scfiles_recency_idx')
-        logger.info("Ensured filesdb indexes (text + season/episode + recency).")
+        logger.info("Ensured filesdb indexes (text + season/episode/year + recency).")
     except Exception as e:
         logger.warning(f"Could not ensure indexes (non-fatal): {e}")
 
@@ -288,7 +298,11 @@ async def get_search_results(query, file_type=None, max_results=None, offset=0, 
     base = _base_filter(file_type, season, episode, year)
     words = [w for w in normalize(query).split(' ') if w]
     coll = Media.collection
-    recency_sort = [('file_date', -1), ('indexed_at', -1)]
+    # Most-recently-*indexed* file first (not necessarily most recently
+    # posted in the source channel — those can differ if a channel was
+    # ever backfilled/indexed out of order). file_date is just the
+    # tiebreaker for anything indexed in the same batch.
+    recency_sort = [('indexed_at', -1), ('file_date', -1)]
 
     # ---- Pass 1 filter (combined / priority) ----
     if info.USE_MONGO_TEXT_SEARCH and query.strip():

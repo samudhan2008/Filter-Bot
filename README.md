@@ -566,3 +566,29 @@ Every poster cached **before** the self-healing feature existed was saved with o
 - **Fixed a related bug this surfaced**: previously, if `edit_message_media` failed for *any* reason (message deleted from the channel, a transient error, etc.), the whole operation aborted with no fallback at all — the archive just silently stopped updating for that poster. It now properly falls back to posting a new message if editing fails, so the archive never gets stuck.
 
 If new messages keep appearing for titles you've *already* seen healed once, that's the thing to send back — a log excerpt showing which of the three cases above it's hitting will tell us immediately whether it's still the migration gap (expected) or something else.
+
+---
+
+## v28: found the real cause of wrong search results + year disambiguation + indexing-order sort
+
+### The actual bug behind "Doraemon" returning "Night Watchman's Journal"
+`normalize()` turned **every** non-alphanumeric character — including apostrophes — into a space. `"Nobita's"` became two tokens: `"nobita"` and a standalone, meaningless `"s"`. The word-level fallback pass (only ever used when nothing matches exactly) then treated that lone `"s"` as a real search term, and `\bs\b` matches almost *any* file with an apostrophe in its name — `"Watchman's"` → `"watchman"` + `"s"` too. That's exactly how an unrelated file surfaced.
+
+**Fixed at the root**: apostrophes (straight `'`, curly `'`/`'`, backtick) are now stripped entirely instead of turned into a separator, so `"Nobita's"` normalizes to `"nobitas"` — one token, consistent on both the query side and the stored-filename side. Verified directly against all three naming conventions you described:
+
+- `"Doraemon- Nobita's Dorabian Nights - 480p.mkv"` → matches
+- `"Doraemon.Nobita's.Dorabian.Nights.480p.SCFiles.mkv"` → matches
+- A bracketed-year variant → matches
+- The false-positive "Night Watchman's Journal" result → no longer matches
+
+Also hardened the fallback pass itself as a second layer of defense: single/double-letter tokens (whether a genuine short word or a normalization artifact) are now excluded from it entirely, same reasoning as the stopword filter from a couple of rounds back (`and`, `the`, etc.) — they add matching risk without adding real signal in an OR-based fallback.
+
+**Migration note, same pattern as previous search-quality rounds**: this fix applies going forward and to the query side immediately, but files already indexed before this update keep their old (space-split) stored name until re-indexed. The last-resort squeeze-match pass (which ignores spaces entirely) should still catch most of these even without re-indexing, but for guaranteed-correct exact matching on titles with apostrophes, re-running `/index` on affected channels is worth doing.
+
+### Year-based disambiguation
+Two titles can share the exact same name but release in different years (remakes, regional versions). Every indexed file now gets a `release_year` parsed at index time — from the filename first, falling back to the caption if the filename doesn't mention one — same extraction logic already used for parsing years out of search queries.
+
+When showing a result, the bot now tries filtering to the TMDB candidate's release year first; if that finds nothing (not every file is tagged with a parsable year), it automatically falls back to the unfiltered search rather than reporting a false "no files found" — same graceful-fallback pattern already used for season/episode filtering.
+
+### Sort order — latest indexed on top
+Search results now sort by `indexed_at` (when *this bot* saved the file) as the primary key, not `file_date` (the file's original post date in the source channel) — these can differ if a channel was ever indexed out of order or backfilled. The most recently indexed file appears first, the first-ever indexed file last. The underlying Mongo index was rebuilt to match (the old one gets dropped and recreated under the same name automatically on next startup, since Mongo won't let two indexes share a name with different key orders).
