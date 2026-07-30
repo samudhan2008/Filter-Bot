@@ -592,3 +592,18 @@ When showing a result, the bot now tries filtering to the TMDB candidate's relea
 
 ### Sort order — latest indexed on top
 Search results now sort by `indexed_at` (when *this bot* saved the file) as the primary key, not `file_date` (the file's original post date in the source channel) — these can differ if a channel was ever indexed out of order or backfilled. The most recently indexed file appears first, the first-ever indexed file last. The underlying Mongo index was rebuilt to match (the old one gets dropped and recreated under the same name automatically on next startup, since Mongo won't let two indexes share a name with different key orders).
+
+---
+
+## v29: fixed file lookup, live shortlink toggle, database management center
+
+### Bug fixed: Indexed File Lookup / User Lookup returned nothing
+Root cause was entirely on the frontend: the admin API proxy (`pages/api/admin/[...path].js`) built the bot API URL from the path segments only and **silently dropped the query string** — so `search_files?q=...` and `user?user_id=...` both reached the bot with no query parameter at all, and correctly failed with "required" errors that never surfaced anywhere visible. Fixed to forward every query param except the routing one.
+
+### Shortlink mode is now live-toggleable from the panel
+`SHORTLINK_MODE` used to be a static value fixed at process start from the env var — changing it meant editing the env var and redeploying. New `database/settingsdb.py` makes it (and future settings) runtime-overridable: a "Turn shortlink ON/OFF" button in the Overview card flips it immediately (cached ~10s across the app, so it takes effect everywhere within a few seconds, not instantly but close). The env var is still what a fresh install starts with — the override only takes precedence once you've actually toggled it at least once.
+
+### New: Database Management Center (`/dbms`)
+A full view/add/edit/delete interface over every collection in the bot's own database, reachable via a new button in the Overview card. Deliberately **scoped to just this bot's database**, not the whole Atlas cluster — your cluster has other databases entirely unrelated to this bot (as your own screenshots showed), and reaching into those would need separate, broader credentials this bot's connection doesn't have anyway. Within that scope, it's genuinely a full power tool: browse any collection with pagination and an optional raw Mongo-JSON filter, add a new document via a JSON editor, edit any existing document, delete with a confirm step. Uses MongoDB Extended JSON under the hood so `ObjectId`/date fields round-trip correctly instead of turning into plain strings.
+
+**Worth being direct about this one**: it's exactly as powerful as connecting a database client directly to production — no schema validation, no undo. It shares the same login/session as `/admin`, gated by the same `ADMIN_API_SECRET`. New bot-side module: `utils/dbms_api.py`.

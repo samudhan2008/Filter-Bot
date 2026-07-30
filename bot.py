@@ -106,6 +106,9 @@ async def _web_server(bot: "SCFilesBot"):
     from utils.admin_api import register_admin_routes
     register_admin_routes(app, bot)
 
+    from utils.dbms_api import register_dbms_routes
+    register_dbms_routes(app, bot)
+
     return app
 
 

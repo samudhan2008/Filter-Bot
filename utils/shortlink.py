@@ -3,14 +3,17 @@ import aiohttp
 
 import info
 from utils.http import get_session
+from database.settingsdb import is_shortlink_mode
 
 logger = logging.getLogger(__name__)
 
 
 async def shorten(url: str) -> str:
-    """Shortens `url` via SHORTLINK_URL/SHORTLINK_API if SHORTLINK_MODE is on,
-    else returns the url unchanged."""
-    if not info.SHORTLINK_MODE or not info.SHORTLINK_URL or not info.SHORTLINK_API:
+    """Shortens `url` via SHORTLINK_URL/SHORTLINK_API if shortlink mode is
+    on (toggleable live from the admin panel — see database/settingsdb.py
+    — falling back to the SHORTLINK_MODE env var if never toggled), else
+    returns the url unchanged."""
+    if not await is_shortlink_mode() or not info.SHORTLINK_URL or not info.SHORTLINK_API:
         return url
     api_url = f"https://{info.SHORTLINK_URL}/api"
     params = {"api": info.SHORTLINK_API, "url": url, "format": "text"}

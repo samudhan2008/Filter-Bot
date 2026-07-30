@@ -9,7 +9,7 @@ from pyrogram.enums import ChatType
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 import info
-from database import filesdb, usersdb, backend, statedb, verifydb
+from database import filesdb, usersdb, backend, statedb, verifydb, settingsdb
 from plugins.group_auth import group_is_allowed, _is_group_admin
 from plugins.force_sub import is_subscribed, fsub_markup
 from utils import tmdb, poster, query as queryutil, texts
@@ -135,7 +135,7 @@ async def on_search_text(bot: Client, message: Message):
     # matters since anyone in a group can tap a button on someone else's
     # result.
     if (
-        info.SHORTLINK_MODE
+        await settingsdb.is_shortlink_mode()
         and info.FRONTEND_URL
         and info.FRONTEND_API_SECRET
         and user

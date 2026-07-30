@@ -5,7 +5,7 @@ from pyrogram import Client, filters, enums
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 import info
-from database import usersdb, filesdb, verifydb
+from database import usersdb, filesdb, verifydb, settingsdb
 from plugins.force_sub import is_subscribed, fsub_markup
 
 logger = logging.getLogger(__name__)
@@ -60,7 +60,7 @@ async def deliver_file(bot: Client, message: Message, file_id: str):
     # that was obtained by genuinely completing the shortlink round trip,
     # proven via a cookie set at the start of that flow and checked again
     # at the end (see database/verifydb.py).
-    if info.SHORTLINK_MODE:
+    if await settingsdb.is_shortlink_mode():
         if info.FRONTEND_URL and info.FRONTEND_API_SECRET:
             if not await verifydb.is_verified(message.from_user.id):
                 return await send_verify_prompt(bot, message)

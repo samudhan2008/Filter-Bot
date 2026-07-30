@@ -29,7 +29,7 @@ from aiohttp import web
 from pyrogram import Client, enums
 
 import info
-from database import usersdb, filesdb, backend, verifydb, auditdb
+from database import usersdb, filesdb, backend, verifydb, auditdb, settingsdb
 from utils.clients import worker_count
 
 logger = logging.getLogger(__name__)
@@ -88,7 +88,7 @@ async def api_stats(request: web.Request):
         'backend_series_cache_age_sec': series_age,
         'worker_bots': worker_count(),
         'search_mode': 'text' if info.USE_MONGO_TEXT_SEARCH else 'regex',
-        'shortlink_mode': info.SHORTLINK_MODE,
+        'shortlink_mode': await settingsdb.is_shortlink_mode(),
         'currently_verified': verified_count,
     })
 
@@ -118,7 +118,7 @@ async def api_health(request: web.Request):
         'backend_circuit_open': backend_breaker.is_open,
         'worker_bots': worker_count(),
         'poster_channel_configured': bool(info.POSTER_CHANNEL),
-        'shortlink_verify_configured': bool(info.SHORTLINK_MODE and info.FRONTEND_URL and info.FRONTEND_API_SECRET),
+        'shortlink_verify_configured': bool(await settingsdb.is_shortlink_mode() and info.FRONTEND_URL and info.FRONTEND_API_SECRET),
     })
 
 
@@ -278,6 +278,15 @@ async def api_backend_refresh(request: web.Request):
 
 
 @_guarded
+async def api_shortlink_toggle(request: web.Request):
+    data = await request.json()
+    enabled = bool(data.get('enabled'))
+    await settingsdb.set_setting('shortlink_mode', enabled)
+    await auditdb.log_action('shortlink_toggle', {'enabled': enabled})
+    return web.json_response({'ok': True, 'shortlink_mode': enabled})
+
+
+@_guarded
 async def api_reindex_check(request: web.Request):
     movies, series = await backend.force_refresh()
     backend_ids = {str(e.get('id', '')).lower() for e in movies + series}
@@ -427,6 +436,7 @@ def register_admin_routes(app: web.Application, bot: Client):
     app.router.add_post('/api/admin/unauth', api_unauth)
     app.router.add_post('/api/admin/broadcast', api_broadcast)
     app.router.add_post('/api/admin/backend_refresh', api_backend_refresh)
+    app.router.add_post('/api/admin/shortlink_toggle', api_shortlink_toggle)
     app.router.add_get('/api/admin/reindex_check', api_reindex_check)
     app.router.add_get('/api/admin/search_files', api_search_files)
     app.router.add_post('/api/admin/index', api_index)
