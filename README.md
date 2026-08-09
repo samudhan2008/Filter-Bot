@@ -607,3 +607,29 @@ Root cause was entirely on the frontend: the admin API proxy (`pages/api/admin/[
 A full view/add/edit/delete interface over every collection in the bot's own database, reachable via a new button in the Overview card. Deliberately **scoped to just this bot's database**, not the whole Atlas cluster — your cluster has other databases entirely unrelated to this bot (as your own screenshots showed), and reaching into those would need separate, broader credentials this bot's connection doesn't have anyway. Within that scope, it's genuinely a full power tool: browse any collection with pagination and an optional raw Mongo-JSON filter, add a new document via a JSON editor, edit any existing document, delete with a confirm step. Uses MongoDB Extended JSON under the hood so `ObjectId`/date fields round-trip correctly instead of turning into plain strings.
 
 **Worth being direct about this one**: it's exactly as powerful as connecting a database client directly to production — no schema validation, no undo. It shares the same login/session as `/admin`, gated by the same `ADMIN_API_SECRET`. New bot-side module: `utils/dbms_api.py`.
+
+---
+
+## v30: the real verification bug, one-time confirmation tokens, and /dbms expansion
+
+### Found and fixed the actual bug: search going silent after verification
+Root cause: `verifydb.is_verified()` compared a datetime read back from MongoDB (naive — Motor/PyMongo doesn't attach timezone info by default) against `datetime.now(timezone.utc)` (aware). **Comparing a naive and an aware datetime in Python raises `TypeError`** — but only once a `verified_until` record actually exists, which is exactly right after someone verifies. That exception was uncaught, so Pyrogram silently swallowed it: no reply, no error, search just went quiet. The exact same bug was also breaking the admin panel's Verification Lookup for any user who'd ever verified (same function, same crash).
+
+**Fixed at the source**, not just patched locally: `database/mongo.py`'s shared client now sets `tz_aware=True`, so every datetime read back from MongoDB across the *entire* codebase comes back timezone-aware, consistent with every write (`datetime.now(timezone.utc)`, used extensively). Also hardened `is_verified()` itself to normalize any legacy naive datetime defensively, in case a record predates this fix.
+
+### One-time random confirmation tokens for the Telegram redirect
+Previously, the "Return to Telegram" link after a successful verification used a generic, static `?start=verified` — the same string for everyone, indefinitely reusable, typeable directly without ever going through verification (functionally harmless, since verification itself was already recorded server-side by that point, but not as tight as it could be). Now:
+
+- `database/verifydb.py`'s `confirm_session()` generates a random UUID (`create_confirm_token`) bound to that specific user the moment verification succeeds.
+- The frontend's `/finish` page uses it directly: `t.me/<bot>?start=<uuid>` — no prefix, matching the format you specified.
+- `plugins/start.py` redeems it (`redeem_confirm_token`) — single-use, deleted the instant it's checked, and rejected if it doesn't belong to the Telegram account trying to use it.
+- A fresh token is generated every time someone verifies; nothing is ever reused.
+
+### `/dbms` expanded
+New bot-side endpoints, all under `/api/admin/dbms/`:
+- `GET /collection/<name>/indexes` — inspect a collection's actual indexes.
+- `GET /collection/<name>/export?q=` — JSON export of whatever the filter matches, capped at 5000 documents.
+- `POST /collection/<name>/bulk_delete` `{filter: {...}}` — delete every matching document in one call. **Requires a non-empty filter** — refuses an empty `{}` outright, since "delete everything" is a different, more destructive action than this panel exposes on purpose (no collection-drop capability at all).
+- Document listing now supports `sort_field`/`sort_dir`.
+
+All logged to the audit trail like everything else in the admin API.

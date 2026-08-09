@@ -105,9 +105,15 @@ async def api_list_documents(request: web.Request):
         except Exception:
             return web.json_response({'ok': False, 'error': 'q must be a valid JSON object (a Mongo filter)'}, status=400)
 
+    sort_field = request.query.get('sort_field', '').strip()
+    sort_dir = -1 if request.query.get('sort_dir', 'desc') == 'desc' else 1
+
     coll = db[name]
     total = await coll.count_documents(filt)
-    cursor = coll.find(filt).skip((page - 1) * page_size).limit(page_size)
+    cursor = coll.find(filt)
+    if sort_field:
+        cursor = cursor.sort(sort_field, sort_dir)
+    cursor = cursor.skip((page - 1) * page_size).limit(page_size)
     docs = await cursor.to_list(length=page_size)
 
     return web.json_response({
@@ -162,9 +168,73 @@ async def api_delete_document(request: web.Request):
     return web.json_response({'ok': True, 'deleted': result.deleted_count})
 
 
+@_guarded
+async def api_collection_indexes(request: web.Request):
+    name = request.match_info['name']
+    if name not in await db.list_collection_names():
+        return web.json_response({'ok': False, 'error': 'No such collection'}, status=404)
+    indexes = await db[name].index_information()
+    return web.json_response({'ok': True, 'indexes': _to_extended_json(indexes)})
+
+
+@_guarded
+async def api_export_collection(request: web.Request):
+    """Full JSON export of whatever the current filter matches — capped so
+    this can't be used to accidentally pull an unbounded number of
+    documents (scfiles_media alone has hundreds of thousands)."""
+    name = request.match_info['name']
+    if name not in await db.list_collection_names():
+        return web.json_response({'ok': False, 'error': 'No such collection'}, status=404)
+
+    filt = {}
+    q = request.query.get('q', '').strip()
+    if q:
+        try:
+            filt = _from_extended_json(json.loads(q))
+            if not isinstance(filt, dict):
+                raise ValueError
+        except Exception:
+            return web.json_response({'ok': False, 'error': 'q must be a valid JSON object'}, status=400)
+
+    EXPORT_CAP = 5000
+    cursor = db[name].find(filt).limit(EXPORT_CAP)
+    docs = await cursor.to_list(length=EXPORT_CAP)
+    await auditdb.log_action('dbms_export', {'collection': name, 'count': len(docs)})
+
+    return web.json_response({
+        'ok': True,
+        'collection': name,
+        'count': len(docs),
+        'capped': len(docs) >= EXPORT_CAP,
+        'documents': _to_extended_json(docs),
+    })
+
+
+@_guarded
+async def api_bulk_delete(request: web.Request):
+    """Deletes every document matching a filter in one go. Requires the
+    filter explicitly (an empty {} filter — 'delete everything' — is
+    refused outright; use dropping the collection for that, which this
+    intentionally doesn't expose at all, since a bulk delete driven by a
+    hand-typed JSON filter is already about as much destructive power as
+    this panel should hand out)."""
+    name = request.match_info['name']
+    body = await request.json()
+    filt = _from_extended_json(body.get('filter', {}))
+    if not isinstance(filt, dict) or not filt:
+        return web.json_response({'ok': False, 'error': 'A non-empty filter is required for bulk delete'}, status=400)
+
+    result = await db[name].delete_many(filt)
+    await auditdb.log_action('dbms_bulk_delete', {'collection': name, 'filter': str(filt), 'deleted': result.deleted_count})
+    return web.json_response({'ok': True, 'deleted': result.deleted_count})
+
+
 def register_dbms_routes(app: web.Application, bot):
     app.router.add_get('/api/admin/dbms/collections', api_list_collections)
     app.router.add_get('/api/admin/dbms/collection/{name}', api_list_documents)
     app.router.add_post('/api/admin/dbms/collection/{name}', api_insert_document)
     app.router.add_put('/api/admin/dbms/collection/{name}', api_update_document)
     app.router.add_delete('/api/admin/dbms/collection/{name}', api_delete_document)
+    app.router.add_get('/api/admin/dbms/collection/{name}/indexes', api_collection_indexes)
+    app.router.add_get('/api/admin/dbms/collection/{name}/export', api_export_collection)
+    app.router.add_post('/api/admin/dbms/collection/{name}/bulk_delete', api_bulk_delete)

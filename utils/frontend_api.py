@@ -50,7 +50,7 @@ async def api_confirm(request: web.Request):
     except Exception:
         return web.json_response({'ok': False, 'error': 'bad request'}, status=400)
 
-    status, user_id = await verifydb.confirm_session(session_id, cookie, ip)
+    status, user_id, confirm_token = await verifydb.confirm_session(session_id, cookie, ip)
 
     if status in ("ok", "ok_flagged"):
         if status == "ok_flagged" and info.LOG_CHANNEL:
@@ -64,7 +64,7 @@ async def api_confirm(request: web.Request):
                     )
                 except Exception:
                     pass
-        return web.json_response({'ok': True})
+        return web.json_response({'ok': True, 'confirm_token': confirm_token})
 
     if status == "mismatch" and user_id:
         bot: Client = request.app.get('bot_client')

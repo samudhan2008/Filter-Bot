@@ -38,6 +38,14 @@ logger = logging.getLogger(__name__)
 
 sessions_col = db['verify_sessions']   # short-lived: one per in-progress verification attempt
 verified_col = db['verified_users']    # user_id -> verified_until
+confirm_tokens_col = db['confirm_tokens']  # one-time token for the final "return to Telegram" redirect
+
+# How long an unused post-verification confirmation token stays valid.
+# Not a security boundary (the actual verification already happened
+# server-side by the time this token exists) — just how long the landing
+# page's "Return to Telegram" link/button stays clickable before someone
+# would need to verify again to get a fresh one.
+CONFIRM_TOKEN_TTL = 600
 
 # Rate-limits how often a fresh verification session can be handed out to
 # the same user — not to stop a legitimate person (nobody taps "verify"
@@ -65,7 +73,8 @@ def _ip_network(ip: str, prefix_v4: int = 24, prefix_v6: int = 64):
 async def ensure_verify_indexes():
     try:
         await sessions_col.create_index('created_at', expireAfterSeconds=info.VERIFY_SESSION_TTL)
-        logger.info("Ensured verify-session TTL index.")
+        await confirm_tokens_col.create_index('created_at', expireAfterSeconds=CONFIRM_TOKEN_TTL)
+        logger.info("Ensured verify-session and confirm-token TTL indexes.")
     except Exception as e:
         logger.warning(f"Could not ensure verify indexes (non-fatal): {e}")
 
@@ -93,13 +102,34 @@ async def set_session_cookie(session_id: str, cookie: str, ip: str = None) -> bo
     return result.matched_count > 0
 
 
+async def create_confirm_token(user_id: int) -> str:
+    """A random one-time token for the final Telegram redirect after a
+    successful verification — used instead of a generic, static
+    "?start=verified" so the landing message is tied to this specific
+    verification for this specific user, not a guessable/reusable fixed
+    string. Single-use (see redeem_confirm_token) and freshly regenerated
+    every time someone verifies, never reused."""
+    token = str(uuid.uuid4())
+    await confirm_tokens_col.insert_one({
+        '_id': token, 'user_id': user_id, 'created_at': datetime.now(timezone.utc),
+    })
+    return token
+
+
+async def redeem_confirm_token(token: str):
+    """One-time use — deletes the token the moment it's checked, whether
+    or not it existed. Returns the bound user_id on success, else None."""
+    doc = await confirm_tokens_col.find_one_and_delete({'_id': token})
+    return doc['user_id'] if doc else None
+
+
 async def confirm_session(session_id: str, cookie: str, ip: str = None):
     """
     Called by the frontend's /finish page with whatever cookie/IP it read
     for this request. One-time use: the session is deleted here regardless
     of outcome.
 
-    Returns (status, user_id):
+    Returns (status, user_id, confirm_token):
       status = "ok"           — cookie matched (and, if STRICT_IP_CHECK is
                                  on, the IP was consistent too).
       status = "ok_flagged"   — cookie matched but the IP looked
@@ -114,14 +144,17 @@ async def confirm_session(session_id: str, cookie: str, ip: str = None):
       status = "not_found"    — no such session (expired, already used, or
                                  never existed) — also treated as
                                  suspicious, but there's no user_id to notify.
+
+    confirm_token is only ever non-None when status is "ok"/"ok_flagged" —
+    see create_confirm_token().
     """
     doc = await sessions_col.find_one_and_delete({'_id': session_id})
     if not doc:
-        return "not_found", None
+        return "not_found", None, None
 
     user_id = doc.get('user_id')
     if not cookie or doc.get('cookie') != cookie:
-        return "mismatch", user_id
+        return "mismatch", user_id, None
 
     ip_consistent = True
     stored_net = _ip_network(doc.get('ip'))
@@ -131,18 +164,25 @@ async def confirm_session(session_id: str, cookie: str, ip: str = None):
         logger.warning(f"Verify session {session_id} (user {user_id}): IP moved from {doc.get('ip')} to {ip}")
 
     if not ip_consistent and info.STRICT_IP_CHECK:
-        return "mismatch", user_id
+        return "mismatch", user_id, None
 
     await verified_col.update_one(
         {'_id': user_id},
         {'$set': {'verified_until': datetime.now(timezone.utc) + timedelta(hours=info.VERIFY_VALID_HOURS)}},
         upsert=True,
     )
-    return ("ok" if ip_consistent else "ok_flagged"), user_id
+    confirm_token = await create_confirm_token(user_id)
+    return ("ok" if ip_consistent else "ok_flagged"), user_id, confirm_token
 
 
 async def is_verified(user_id: int) -> bool:
     doc = await verified_col.find_one({'_id': user_id})
     if not doc or not doc.get('verified_until'):
         return False
-    return doc['verified_until'] > datetime.now(timezone.utc)
+    verified_until = doc['verified_until']
+    if verified_until.tzinfo is None:
+        # Defensive: shouldn't happen with tz_aware=True on the shared
+        # client (database/mongo.py), but never let a naive/aware mismatch
+        # here raise and silently kill the search flow again.
+        verified_until = verified_until.replace(tzinfo=timezone.utc)
+    return verified_until > datetime.now(timezone.utc)

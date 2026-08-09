@@ -29,15 +29,26 @@ async def start_cmd(bot: Client, message: Message):
     args = message.text.split(maxsplit=1)
     if len(args) > 1 and args[1].startswith('file_'):
         return await deliver_file(bot, message, args[1].split('file_', 1)[1])
-    if len(args) > 1 and args[1] == 'verified':
-        # Verification itself already happened server-side (the frontend's
-        # /finish page called our API directly) — this is just the user
-        # landing back in Telegram afterward, so there's nothing left to
-        # redeem here, just acknowledge it.
-        return await message.reply(
-            f"✅ <b>You're verified!</b> Go ahead and tap the file button again — "
-            f"you're good for the next {info.VERIFY_VALID_HOURS} hours."
-        )
+
+    if len(args) > 1 and args[1]:
+        # A one-time confirmation token from the verification frontend's
+        # final redirect — a bare random UUID, no prefix (see
+        # verifydb.create_confirm_token). Verification itself already
+        # happened server-side before this redirect; redeeming this token
+        # just confirms it was genuinely *this* verification session
+        # landing back in Telegram, not a reused/guessed link, and this is
+        # a normal chat message, so there's no harm in trying the lookup
+        # for any non-file start param — it's just a cheap one-time DB
+        # check that no-ops into the regular welcome message below if it
+        # doesn't match anything.
+        confirmed_user_id = await verifydb.redeem_confirm_token(args[1])
+        if confirmed_user_id is not None:
+            if confirmed_user_id == user.id:
+                return await message.reply(
+                    f"✅ <b>You're verified!</b> Go ahead and tap the file button again — "
+                    f"you're good for the next {info.VERIFY_VALID_HOURS} hours."
+                )
+            return await message.reply("❌ This confirmation link isn't for your account.")
 
     await message.reply(
         f"👋 Hi {user.mention}, I'm <b>SC Files Bot</b>!\n\n"
