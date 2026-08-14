@@ -149,3 +149,14 @@ WORKERS = int(environ.get('WORKERS', '8'))
 USE_CAPTION_FILTER = is_enabled(environ.get('USE_CAPTION_FILTER', 'True'), True)
 
 SUPPORT_CHAT = environ.get('SUPPORT_CHAT', '')
+
+# ---- Keepalive (free-tier anti-sleep) ----
+# The bot's own public web server URL (e.g. https://your-bot.onrender.com or
+# https://your-bot.koyeb.app) — the same host PORT above is served on. Left
+# unset by default: only needed on hosts that spin down idle free
+# instances. Self-pings the "/" health route on an interval so the
+# platform always sees recent inbound HTTP traffic and never treats the
+# service as idle. Has no effect on paid/always-on instances beyond a
+# harmless periodic GET.
+PING_URL = environ.get('PING_URL', '').rstrip('/')
+PING_INTERVAL = int(environ.get('PING_INTERVAL', '300'))  # seconds, default 5 min

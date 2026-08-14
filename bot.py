@@ -91,6 +91,8 @@ class SCFilesBot(Client):
     async def stop(self, *args):
         from utils.clients import stop_workers
         from utils.http import close_session
+        from utils.keepalive import stop_keepalive
+        await stop_keepalive()
         await stop_workers()
         await close_session()
         await super().stop()
@@ -126,6 +128,10 @@ if __name__ == '__main__':
         await runner.setup()
         site = web.TCPSite(runner, "0.0.0.0", int(info.PORT))
         await site.start()
+
+        from utils.keepalive import start_keepalive
+        await start_keepalive()
+
         await idle()
         await bot.stop()
 
