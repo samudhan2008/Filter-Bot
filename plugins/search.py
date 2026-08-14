@@ -14,6 +14,7 @@ from plugins.group_auth import group_is_allowed, _is_group_admin
 from plugins.force_sub import is_subscribed, fsub_markup
 from utils import tmdb, poster, query as queryutil, texts
 from utils.filesize import human_size
+from utils.deeplink import build_file_payload
 
 logger = logging.getLogger(__name__)
 
@@ -36,12 +37,17 @@ async def _new_result_entry(files, query, season, episode, offset, max_results, 
     return token, ctx
 
 
-async def _file_button_rows(bot: Client, files):
+async def _file_button_rows(bot: Client, files, origin_chat_id: int):
     """One button per file, always a plain t.me/<bot>?start=file_<id> deep
     link — never shortened here. Being a real Telegram deep link, it
     always opens the clicker's own PM regardless of where the button was
     pressed, and always maps to exactly one file, so there's no ambiguity
     about which file a tap delivers.
+
+    The payload also carries `origin_chat_id` (the group this result was
+    shown in, or the user's own PM) packed via utils.deeplink — purely so
+    deliver_file can report *where* a file was taken from, for the new
+    delivery-log feature. It doesn't affect delivery itself.
 
     The shortlink (when SHORTLINK_MODE is on) belongs *only* to the
     one-time verification step in plugins/start.py's deliver_file — once a
@@ -52,7 +58,8 @@ async def _file_button_rows(bot: Client, files):
     """
     rows = []
     for f in files:
-        deep_link = f"https://t.me/{bot.username}?start=file_{f['file_id']}"
+        payload = build_file_payload(f['file_id'], origin_chat_id)
+        deep_link = f"https://t.me/{bot.username}?start={payload}"
         rows.append([InlineKeyboardButton(
             texts.FILE_BUTTON_LABEL.format(name=f['file_name'][:55], size=human_size(f['file_size'])),
             url=deep_link,
@@ -74,8 +81,8 @@ def _pagination_row(token, offset, max_results, total):
     return [row]
 
 
-async def _build_markup(bot: Client, token, files, ctx):
-    rows = await _file_button_rows(bot, files)
+async def _build_markup(bot: Client, token, files, ctx, origin_chat_id: int):
+    rows = await _file_button_rows(bot, files, origin_chat_id)
     for row in ctx.get("extra_buttons", []):
         rows.append([InlineKeyboardButton(b["text"], url=b["url"]) for b in row])
     rows.extend(_pagination_row(token, ctx["offset"], ctx["max_results"], ctx["total"]))
@@ -266,7 +273,7 @@ async def _send_plain_results(bot: Client, message: Message, clean_query: str, s
         return await message.reply(texts.not_found(clean_query))
 
     token, ctx = await _new_result_entry(files, clean_query, season, episode, 0, max_results, total)
-    markup = await _build_markup(bot, token, files, ctx)
+    markup = await _build_markup(bot, token, files, ctx, message.chat.id)
     await message.reply(
         f"📦 Found <b>{total}</b> file(s) for <b>{clean_query}</b>:",
         reply_markup=markup,
@@ -292,7 +299,9 @@ async def on_paginate(bot: Client, cq: CallbackQuery):
     await statedb.update_results(token, files, ctx)
 
     try:
-        await cq.message.edit_reply_markup(reply_markup=await _build_markup(bot, token, files, ctx))
+        await cq.message.edit_reply_markup(
+            reply_markup=await _build_markup(bot, token, files, ctx, cq.message.chat.id)
+        )
     except Exception as e:
         logger.warning(f"Pagination edit failed: {e}")
     await cq.answer()
@@ -586,7 +595,7 @@ async def _show_result(bot: Client, message: Message, candidate: dict, clean_que
     ) + ep_note
 
     token, ctx = await _new_result_entry(files, effective_query, season, episode, 0, max_results, total, extra_buttons)
-    markup = await _build_markup(bot, token, files, ctx)
+    markup = await _build_markup(bot, token, files, ctx, chat_id)
 
     if status_msg:
         try:

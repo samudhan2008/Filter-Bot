@@ -29,7 +29,7 @@ from aiohttp import web
 from pyrogram import Client, enums
 
 import info
-from database import usersdb, filesdb, backend, verifydb, auditdb, settingsdb
+from database import usersdb, filesdb, backend, verifydb, auditdb, settingsdb, filedeliverydb
 from utils.clients import worker_count
 
 logger = logging.getLogger(__name__)
@@ -423,6 +423,28 @@ async def api_audit_log(request: web.Request):
     return web.json_response({'ok': True, 'entries': entries})
 
 
+# --------------------------------------------------------- file deliveries ----
+
+@_guarded
+async def api_file_deliveries(request: web.Request):
+    limit_raw = request.query.get('limit', '50')
+    try:
+        limit = max(1, min(200, int(limit_raw)))
+    except ValueError:
+        limit = 50
+
+    user_id = None
+    user_id_raw = request.query.get('user_id')
+    if user_id_raw:
+        if not user_id_raw.lstrip('-').isdigit():
+            return web.json_response({'ok': False, 'error': 'user_id must be numeric'}, status=400)
+        user_id = int(user_id_raw)
+
+    entries = await filedeliverydb.recent(limit, user_id=user_id)
+    total = await filedeliverydb.total_count()
+    return web.json_response({'ok': True, 'entries': entries, 'total': total})
+
+
 def register_admin_routes(app: web.Application, bot: Client):
     app['bot_client'] = bot  # shared with utils/frontend_api.py — harmless to set from both
     app.router.add_get('/api/admin/stats', api_stats)
@@ -442,3 +464,4 @@ def register_admin_routes(app: web.Application, bot: Client):
     app.router.add_post('/api/admin/index', api_index)
     app.router.add_get('/api/admin/logs', api_logs)
     app.router.add_get('/api/admin/audit_log', api_audit_log)
+    app.router.add_get('/api/admin/file_deliveries', api_file_deliveries)

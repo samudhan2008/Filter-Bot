@@ -5,8 +5,9 @@ from pyrogram import Client, filters, enums
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 
 import info
-from database import usersdb, filesdb, verifydb, settingsdb
+from database import usersdb, filesdb, verifydb, settingsdb, filedeliverydb
 from plugins.force_sub import is_subscribed, fsub_markup
+from utils.deeplink import split_file_payload
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,8 @@ async def start_cmd(bot: Client, message: Message):
 
     args = message.text.split(maxsplit=1)
     if len(args) > 1 and args[1].startswith('file_'):
-        return await deliver_file(bot, message, args[1].split('file_', 1)[1])
+        file_id, origin_chat_id = split_file_payload(args[1].split('file_', 1)[1])
+        return await deliver_file(bot, message, file_id, origin_chat_id)
 
     if len(args) > 1 and args[1]:
         # A one-time confirmation token from the verification frontend's
@@ -62,7 +64,7 @@ async def start_cmd(bot: Client, message: Message):
     )
 
 
-async def deliver_file(bot: Client, message: Message, file_id: str):
+async def deliver_file(bot: Client, message: Message, file_id: str, origin_chat_id: int = None):
     # Anti-bypass gate: only active when SHORTLINK_MODE is on, and only if
     # the frontend that runs the cookie-continuity check is actually
     # configured. Sharing a raw file_id deep link (or even the raw
@@ -98,6 +100,67 @@ async def deliver_file(bot: Client, message: Message, file_id: str):
     except Exception as e:
         logger.warning(f"send_cached_media failed: {e}")
         await message.reply("❌ Couldn't send that file. It may have expired — please search again.")
+        return
+
+    await _log_file_delivery(bot, message.from_user, file_id, doc.file_name, origin_chat_id)
+
+
+async def _log_file_delivery(bot: Client, user, file_id: str, file_name: str, origin_chat_id):
+    """Records the delivery in Mongo (for the admin dashboard) and posts a
+    one-line notice to LOG_CHANNEL. Fires only after send_cached_media has
+    already succeeded above, so this never blocks or fails the actual file
+    delivery to the user — logging problems here are swallowed, not
+    surfaced to them.
+    """
+    source_type = "unknown"
+    source_title = ""
+    if origin_chat_id is None:
+        source_type = "unknown"
+    elif origin_chat_id == user.id or origin_chat_id > 0:
+        source_type = "private"
+    else:
+        source_type = "group"
+        try:
+            group_doc = await usersdb.groups_col.find_one({'_id': origin_chat_id})
+            source_title = (group_doc or {}).get('title', '')
+        except Exception as e:
+            logger.warning(f"Could not look up group title for delivery log: {e}")
+
+    user_name = user.mention if user else ""
+
+    try:
+        await filedeliverydb.log_delivery(
+            user_id=user.id if user else 0,
+            user_name=user_name,
+            file_id=file_id,
+            file_name=file_name,
+            source_type=source_type,
+            source_chat_id=origin_chat_id,
+            source_title=source_title,
+        )
+    except Exception as e:
+        logger.warning(f"Could not record file delivery: {e}")
+
+    if not info.LOG_CHANNEL:
+        return
+
+    if source_type == "private":
+        source_line = "💬 Direct in bot PM"
+    elif source_type == "group":
+        source_line = f"👥 Group: {source_title or 'Untitled'} (<code>{origin_chat_id}</code>)"
+    else:
+        source_line = "❔ Unknown (old link)"
+
+    try:
+        await bot.send_message(
+            info.LOG_CHANNEL,
+            "📤 <b>File delivered</b>\n\n"
+            f"👤 User: {user_name} (<code>{user.id if user else '?'}</code>)\n"
+            f"📄 File: {file_name or file_id}\n"
+            f"📍 Source: {source_line}",
+        )
+    except Exception as e:
+        logger.warning(f"Could not post delivery notice to LOG_CHANNEL: {e}")
 
 
 async def send_verify_prompt(bot: Client, message: Message):

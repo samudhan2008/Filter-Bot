@@ -64,6 +64,9 @@ class SCFilesBot(Client):
         from database.auditdb import ensure_audit_indexes
         await ensure_audit_indexes()
 
+        from database.filedeliverydb import ensure_delivery_indexes
+        await ensure_delivery_indexes()
+
         # Optional multi-client worker pool for send/broadcast load spreading.
         from utils.clients import start_workers
         workers = await start_workers()
