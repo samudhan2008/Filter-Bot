@@ -2,14 +2,49 @@ import asyncio
 import logging
 
 from pyrogram import Client, filters
-from pyrogram.types import Message
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.errors import FloodWait
 
 import info
-from database import usersdb, filesdb, backend
+from database import usersdb, filesdb, backend, settingsdb
 from utils.clients import get_sender, worker_count
 
 logger = logging.getLogger(__name__)
+
+
+def _pm_toggle_markup(pm_on: bool) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(f"{'✅' if pm_on else '⬜️'} Turn ON", callback_data="pm_search|on"),
+        InlineKeyboardButton(f"{'✅' if not pm_on else '⬜️'} Turn OFF", callback_data="pm_search|off"),
+    ]])
+
+
+@Client.on_message(filters.command('pm') & filters.user(info.ADMINS))
+async def pm_cmd(bot: Client, message: Message):
+    pm_on = await settingsdb.is_pm_search_mode()
+    await message.reply(
+        f"💬 <b>PM Search Mode</b>\n\n"
+        f"Currently: <b>{'ON' if pm_on else 'OFF'}</b>\n\n"
+        f"When off, users searching in the bot's PM get redirected to "
+        f"<b>{info.PM_SEARCH_REDIRECT_CHANNEL}</b> instead of getting results.\n"
+        f"Group search is never affected by this.",
+        reply_markup=_pm_toggle_markup(pm_on),
+    )
+
+
+@Client.on_callback_query(filters.regex(r'^pm_search\|(on|off)$') & filters.user(info.ADMINS))
+async def pm_search_toggle_cq(bot: Client, cq: CallbackQuery):
+    enabled = cq.data.split('|', 1)[1] == 'on'
+    await settingsdb.set_setting('pm_search_mode', enabled)
+    await cq.answer(f"PM search turned {'ON' if enabled else 'OFF'}.")
+    await cq.message.edit_text(
+        f"💬 <b>PM Search Mode</b>\n\n"
+        f"Currently: <b>{'ON' if enabled else 'OFF'}</b>\n\n"
+        f"When off, users searching in the bot's PM get redirected to "
+        f"<b>{info.PM_SEARCH_REDIRECT_CHANNEL}</b> instead of getting results.\n"
+        f"Group search is never affected by this.",
+        reply_markup=_pm_toggle_markup(enabled),
+    )
 
 
 @Client.on_message(filters.command('ban') & filters.user(info.ADMINS))

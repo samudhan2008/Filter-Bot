@@ -71,3 +71,8 @@ ADMIN_NOT_ON_WEBSITE = (
 )
 
 FILE_BUTTON_LABEL = "📄 {name} ({size})"
+
+PM_SEARCH_DISABLED = (
+    "🚫 <b>PM search is currently off.</b>\n\n"
+    "Please search for files in {channel} instead."
+)

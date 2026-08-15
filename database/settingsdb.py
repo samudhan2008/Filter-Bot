@@ -40,3 +40,7 @@ async def set_setting(key: str, value):
 
 async def is_shortlink_mode() -> bool:
     return bool(await get_setting('shortlink_mode', info.SHORTLINK_MODE))
+
+
+async def is_pm_search_mode() -> bool:
+    return bool(await get_setting('pm_search_mode', info.PM_SEARCH_MODE))

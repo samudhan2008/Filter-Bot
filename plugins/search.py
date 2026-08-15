@@ -111,7 +111,7 @@ async def on_close_result(bot: Client, cq: CallbackQuery):
 @Client.on_message(
     filters.text & ~filters.via_bot & ~filters.command(
         ['start', 'index', 'auth', 'unauth', 'authlist', 'ban', 'unban', 'broadcast', 'stats', 'logs',
-         'setskip', 'reindex_check']
+         'setskip', 'reindex_check', 'pm']
     ) & (filters.group | filters.private)
 )
 async def on_search_text(bot: Client, message: Message):
@@ -128,6 +128,14 @@ async def on_search_text(bot: Client, message: Message):
         await usersdb.add_group(message.chat.id, message.chat.title or "")
         if not await group_is_allowed(message.chat.id):
             return  # silently ignore unauthorized groups, no spam
+    elif not await settingsdb.is_pm_search_mode():
+        # PM search is toggled off — redirect instead of searching. Checked
+        # only for private chats; group search is untouched either way.
+        channel = info.PM_SEARCH_REDIRECT_CHANNEL
+        markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🔎 Search there", url=f"https://t.me/{channel.lstrip('@')}")
+        ]])
+        return await message.reply(texts.PM_SEARCH_DISABLED.format(channel=channel), reply_markup=markup)
 
     if user and not await is_subscribed(bot, user.id):
         markup = await fsub_markup(bot)

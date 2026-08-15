@@ -89,6 +89,7 @@ async def api_stats(request: web.Request):
         'worker_bots': worker_count(),
         'search_mode': 'text' if info.USE_MONGO_TEXT_SEARCH else 'regex',
         'shortlink_mode': await settingsdb.is_shortlink_mode(),
+        'pm_search_mode': await settingsdb.is_pm_search_mode(),
         'currently_verified': verified_count,
     })
 
@@ -287,6 +288,15 @@ async def api_shortlink_toggle(request: web.Request):
 
 
 @_guarded
+async def api_pm_search_toggle(request: web.Request):
+    data = await request.json()
+    enabled = bool(data.get('enabled'))
+    await settingsdb.set_setting('pm_search_mode', enabled)
+    await auditdb.log_action('pm_search_toggle', {'enabled': enabled})
+    return web.json_response({'ok': True, 'pm_search_mode': enabled})
+
+
+@_guarded
 async def api_reindex_check(request: web.Request):
     movies, series = await backend.force_refresh()
     backend_ids = {str(e.get('id', '')).lower() for e in movies + series}
@@ -459,6 +469,7 @@ def register_admin_routes(app: web.Application, bot: Client):
     app.router.add_post('/api/admin/broadcast', api_broadcast)
     app.router.add_post('/api/admin/backend_refresh', api_backend_refresh)
     app.router.add_post('/api/admin/shortlink_toggle', api_shortlink_toggle)
+    app.router.add_post('/api/admin/pm_search_toggle', api_pm_search_toggle)
     app.router.add_get('/api/admin/reindex_check', api_reindex_check)
     app.router.add_get('/api/admin/search_files', api_search_files)
     app.router.add_post('/api/admin/index', api_index)

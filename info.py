@@ -160,3 +160,13 @@ SUPPORT_CHAT = environ.get('SUPPORT_CHAT', '')
 # harmless periodic GET.
 PING_URL = environ.get('PING_URL', '').rstrip('/')
 PING_INTERVAL = int(environ.get('PING_INTERVAL', '300'))  # seconds, default 5 min
+
+# ---- PM search toggle ----
+# When off, users searching in the bot's PM get redirected to
+# PM_SEARCH_REDIRECT_CHANNEL instead of getting results directly. Group
+# search is never affected by this — it only gates private-chat search.
+# Like shortlink_mode, this env var is only the fresh-install default;
+# admins flip it live via /pm in the bot or the admin panel, which is
+# stored in settingsdb and takes precedence once toggled.
+PM_SEARCH_MODE = environ.get('PM_SEARCH_MODE', 'True').lower() == 'true'
+PM_SEARCH_REDIRECT_CHANNEL = environ.get('PM_SEARCH_REDIRECT_CHANNEL', '@sc_requests')
