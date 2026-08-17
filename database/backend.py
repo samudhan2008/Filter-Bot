@@ -119,6 +119,12 @@ async def find_entry(kind: str, tmdb_id, title: str = ""):
 
 
 def website_link(kind: str, entry: dict) -> str:
+    """Builds the public SC Files website URL for a movie/series/collection
+    entry. Path-based (e.g. /movie/123), matching the website's actual
+    routing — not query-string based."""
+    entry_id = entry.get('id')
     if kind == "movie":
-        return f"{info.WEBSITE_URL}/movie?id={entry.get('id')}"
-    return f"{info.WEBSITE_URL}/pages/series?id={entry.get('id')}"
+        return f"{info.WEBSITE_URL}/movie/{entry_id}"
+    if kind == "collection":
+        return f"{info.WEBSITE_URL}/collections/{entry_id}"
+    return f"{info.WEBSITE_URL}/series/{entry_id}"
